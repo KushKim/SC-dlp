@@ -1,6 +1,6 @@
 # SoundCloud Downloader
 
-Tauri 2 + React + TypeScript desktop application. This first milestone establishes the dark UI and navigation; downloader and library controls are intentionally marked as unavailable until their Rust backend is implemented.
+Tauri 2 + React + TypeScript desktop app. The UI foundation is in place and the next milestone adds a Rust command for checking the yt-dlp executable and previewing SoundCloud metadata.
 
 ## Development
 
@@ -9,11 +9,13 @@ npm install
 npm run tauri:dev
 ```
 
-## First milestone
+## Current milestone
 
-- Vite, React, TypeScript, Tailwind CSS and Lucide React foundation
-- Responsive dark dashboard and navigation for Dashboard, Playlist, Downloads, Library and Settings
-- Playlist URL field with analysis explicitly marked as not implemented
-- Tauri 2 Rust application skeleton and NSIS bundle target
+- Rust/Tauri command registration and a minimal default capability
+- yt-dlp runtime detection and version check
+- SoundCloud HTTPS URL validation and metadata-only inspection (`--skip-download`)
+- Playlist metadata preview capped at 200 entries
+- The executable is intentionally not committed. For local testing, add the official Windows binary at `src-tauri/binaries/yt-dlp.exe`; the app reports when it is missing.
+- No download queue, audio download, cookie authentication, or file management is implemented yet.
 
-The sample dashboard rows are visual examples only; statistics show zero and do not claim a working download engine.
+Rust URL-validation tests can be run with `cargo test --manifest-path src-tauri/Cargo.toml` in a configured Rust/Tauri environment. Build and runtime tests have not been run in this hosted editing session.
