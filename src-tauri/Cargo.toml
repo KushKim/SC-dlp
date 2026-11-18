@@ -3,11 +3,19 @@ name = "soundcloud-downloader"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "soundcloud_downloader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+libc = "0.2"
 
 [profile.release]
 panic = "abort"
