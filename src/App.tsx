@@ -16,7 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -25,6 +25,7 @@ import { Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'reac
 type Page = { title: string; subtitle: string; icon: LucideIcon };
 type AppSettings = {
   downloadDirectory: string;
+  ytDlpPath: string;
   audioFormat: 'original' | 'mp3';
   audioQuality: string;
   maxConcurrent: number;
@@ -35,6 +36,8 @@ type AppSettings = {
 type ToolStatus = { available: boolean; version: string | null; error: string | null };
 type EngineStatus = { ytDlp: ToolStatus; ffmpeg: ToolStatus };
 type TrackMetadata = { url: string; title: string; sourceId: string | null; artist: string | null; duration: number | null; selected: boolean };
+type PlaylistAnalysis = { tracks: TrackMetadata[]; totalEntries: number; skippedEntries: number; warning: string | null };
+type AnalysisProgress = { id: string; processed: number; total: number | null };
 type JobStatus = 'queued' | 'downloading' | 'completed' | 'failed' | 'cancelled';
 type DownloadJob = {
   id: string;
@@ -70,6 +73,7 @@ const statusLabels: Record<JobStatus, string> = {
   failed: '실패',
   cancelled: '취소됨',
 };
+const ANALYSIS_PAGE_SIZE = 100;
 
 const pages: Record<string, Page> = {
   '/': { title: '대시보드', subtitle: '다운로드와 라이브러리 상태를 확인하세요.', icon: Home },
@@ -167,23 +171,62 @@ function Playlist() {
   const navigate = useNavigate();
   const [url, setUrl] = useState('');
   const [tracks, setTracks] = useState<TrackMetadata[]>([]);
+  const [analysisSummary, setAnalysisSummary] = useState<{ totalEntries: number; skippedEntries: number; warning: string | null } | null>(null);
   const [loading, setLoading] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [analysisId, setAnalysisId] = useState<string | null>(null);
+  const [analysisProgress, setAnalysisProgress] = useState<AnalysisProgress | null>(null);
+  const [cancelingAnalysis, setCancelingAnalysis] = useState(false);
+  const [page, setPage] = useState(0);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const cancelRequested = useRef(false);
   const selectedCount = tracks.filter((track) => track.selected).length;
+  const pageCount = Math.max(1, Math.ceil(tracks.length / ANALYSIS_PAGE_SIZE));
+  const pageTracks = tracks.slice(page * ANALYSIS_PAGE_SIZE, (page + 1) * ANALYSIS_PAGE_SIZE);
 
   async function analyze() {
     setLoading(true);
     setError('');
     setMessage('');
     setTracks([]);
+    setAnalysisSummary(null);
+    setPage(0);
+    setAnalysisProgress(null);
+    setCancelingAnalysis(false);
+    cancelRequested.current = false;
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setAnalysisId(id);
+    let unlisten: (() => void) | undefined;
     try {
-      setTracks(await invoke<TrackMetadata[]>('analyze_url', { url }));
+      unlisten = await listen<AnalysisProgress>('playlist-analysis-progress', ({ payload }) => {
+        if (payload.id === id) setAnalysisProgress(payload);
+      });
+      const result = await invoke<PlaylistAnalysis>('analyze_url', { id, url });
+      setTracks(result.tracks);
+      setAnalysisSummary({ totalEntries: result.totalEntries, skippedEntries: result.skippedEntries, warning: result.warning });
     } catch (cause) {
-      setError(String(cause));
+      if (cancelRequested.current) setMessage('플레이리스트 분석을 취소했습니다.');
+      else setError(String(cause));
     } finally {
+      unlisten?.();
       setLoading(false);
+      setAnalysisId(null);
+      setAnalysisProgress(null);
+      setCancelingAnalysis(false);
+    }
+  }
+
+  async function cancelAnalysis() {
+    if (!analysisId) return;
+    cancelRequested.current = true;
+    setCancelingAnalysis(true);
+    try {
+      await invoke('cancel_playlist_analysis', { id: analysisId });
+    } catch (cause) {
+      cancelRequested.current = false;
+      setCancelingAnalysis(false);
+      setError(String(cause));
     }
   }
 
@@ -223,8 +266,27 @@ function Playlist() {
             {loading ? <LoaderCircle size={16} className="animate-spin" /> : <Search size={16} />}
             {loading ? '메타데이터 분석 중' : 'URL 분석'}
           </button>
+          {loading && (
+            <button type="button" onClick={() => void cancelAnalysis()} disabled={cancelingAnalysis} className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-3 text-sm text-zinc-300 disabled:opacity-50">
+              <X size={16} /> {cancelingAnalysis ? '취소 중' : '분석 취소'}
+            </button>
+          )}
         </div>
-        <p className="mt-3 text-xs text-zinc-500">플레이리스트의 전체 트랙 정보를 분석합니다. 분석만으로 파일을 저장하지 않으며, 전체 선택 또는 원하는 트랙을 선택해 대기열에 추가하세요.</p>
+        <p className="mt-3 text-xs text-zinc-500">최대 20,000개 트랙의 정보를 분석해 100개씩 표시합니다. 분석만으로 파일을 저장하지 않으며, 전체 선택 또는 원하는 트랙을 선택해 대기열에 추가하세요.</p>
+        {loading && (
+          <div className="mt-4" role="status" aria-live="polite">
+            <p className="text-sm text-zinc-300">
+              {analysisProgress
+                ? `트랙 정보 ${analysisProgress.processed}${analysisProgress.total ? ` / ${analysisProgress.total}` : ''}개 확인 중`
+                : 'SoundCloud에서 트랙 정보를 가져오는 중'}
+            </p>
+            {analysisProgress?.total ? (
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/10">
+                <div className="h-full rounded-full bg-brand transition-all" style={{ width: `${Math.min(100, analysisProgress.processed / analysisProgress.total * 100)}%` }} />
+              </div>
+            ) : null}
+          </div>
+        )}
       </Card>
       {error && <p role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">{error}</p>}
       {message && <p role="status" className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-300">{message}</p>}
@@ -233,7 +295,9 @@ function Playlist() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="font-semibold text-white">분석 결과</h2>
-              <p className="mt-1 text-sm text-zinc-500">{tracks.length}개 트랙 · 선택한 트랙만 큐에 추가됩니다.</p>
+              <p className="mt-1 text-sm text-zinc-500">
+                전체 {analysisSummary?.totalEntries ?? tracks.length}개 중 {tracks.length}개 확인 · 선택한 트랙만 큐에 추가됩니다.
+              </p>
             </div>
             <div className="flex flex-wrap gap-2">
               <button type="button" onClick={() => toggleAll(true)} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5">전체 선택</button>
@@ -243,9 +307,25 @@ function Playlist() {
               </button>
             </div>
           </div>
+          {analysisSummary?.skippedEntries || analysisSummary?.warning ? (
+            <p role="alert" className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-300">
+              {analysisSummary.warning || `${analysisSummary.skippedEntries}개 항목은 트랙 정보를 가져오지 못해 제외되었습니다.`}
+            </p>
+          ) : null}
+          {pageCount > 1 && (
+            <div className="mt-4 flex items-center justify-between border-t border-white/[.06] pt-3">
+              <p className="text-xs text-zinc-500">{tracks.length}개 중 {page * ANALYSIS_PAGE_SIZE + 1}–{Math.min((page + 1) * ANALYSIS_PAGE_SIZE, tracks.length)}개 표시</p>
+              <div className="flex items-center gap-3">
+                <button type="button" onClick={() => setPage((current) => Math.max(0, current - 1))} disabled={page === 0} className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-zinc-300 disabled:opacity-40">이전</button>
+                <span className="text-xs text-zinc-500">{page + 1} / {pageCount}</span>
+                <button type="button" onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))} disabled={page + 1 >= pageCount} className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-zinc-300 disabled:opacity-40">다음</button>
+              </div>
+            </div>
+          )}
           <div className="mt-4 divide-y divide-white/[.06]">
-            {tracks.map((track, index) => (
-              <label key={`${track.url}-${index}`} className="flex cursor-pointer items-center gap-3 py-3">
+            {pageTracks.map((track, pageIndex) => {
+              const index = page * ANALYSIS_PAGE_SIZE + pageIndex;
+              return <label key={`${track.url}-${index}`} className="flex cursor-pointer items-center gap-3 py-3">
                 <input
                   type="checkbox"
                   checked={track.selected}
@@ -257,8 +337,8 @@ function Playlist() {
                   <span className="block truncate text-xs text-zinc-500">{track.artist || '아티스트 정보 없음'}</span>
                 </span>
                 <span className="shrink-0 text-xs text-zinc-500">{formatDuration(track.duration)}</span>
-              </label>
-            ))}
+              </label>;
+            })}
           </div>
         </Card>
       )}
@@ -491,7 +571,9 @@ function SettingsPage() {
     setSaved(false);
     setError('');
     try {
-      setSettings(await invoke<AppSettings>('save_settings', { settings }));
+      const savedSettings = await invoke<AppSettings>('save_settings', { settings });
+      setSettings(savedSettings);
+      setEngine(await invoke<EngineStatus>('get_engine_status'));
       setSaved(true);
     } catch (cause) {
       setError(String(cause));
@@ -590,7 +672,7 @@ function SettingsPage() {
           </Card>
           <Card>
             <h2 className="font-semibold text-white">다운로드 엔진</h2>
-            <p className="mt-2 text-sm text-zinc-500">실행 파일은 저장소에 포함되지 않습니다. 설치 후 PATH에서 확인합니다.</p>
+            <p className="mt-2 text-sm text-zinc-500">실행 파일은 저장소에 포함되지 않습니다. yt-dlp는 PATH 검색 또는 아래에 입력한 경로를 사용합니다.</p>
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               {tools.map(({ name, status: tool }) => (
                 <div key={name} className="rounded-xl border border-white/[.07] bg-black/20 p-4">
@@ -600,6 +682,30 @@ function SettingsPage() {
                   </p>
                 </div>
               ))}
+            </div>
+            <label className="mt-4 block text-sm text-zinc-300">
+              yt-dlp 실행 파일 경로 (선택)
+              <input
+                value={settings.ytDlpPath}
+                onChange={(event) => update('ytDlpPath', event.target.value)}
+                placeholder="비워 두면 PATH에서 검색"
+                spellCheck={false}
+                className="mt-2 h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-white placeholder:text-zinc-600"
+              />
+              <span className="mt-1 block text-xs text-zinc-500">
+                PATH 검색이 안 되면 yt-dlp 실행 파일의 전체 경로를 입력하고 설정을 저장하세요. Windows 예: C:\Tools\yt-dlp.exe
+              </span>
+            </label>
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={save}
+                disabled={saving}
+                className="rounded-xl bg-brand px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+              >
+                {saving ? '저장 중…' : '엔진 설정 저장'}
+              </button>
+              {saved && <span role="status" className="text-sm text-emerald-400">설정을 저장했습니다.</span>}
             </div>
           </Card>
         </>
@@ -619,7 +725,7 @@ export default function App() {
       <aside className="flex shrink-0 flex-col border-b border-white/[.07] bg-[#0e0e14] md:sticky md:top-0 md:h-screen md:w-64 md:border-b-0 md:border-r">
         <div className="flex items-center gap-3 px-5 py-5">
           <div className="grid h-10 w-10 place-items-center rounded-xl bg-brand text-white"><Disc3 size={22} /></div>
-          <div><p className="font-semibold tracking-tight text-white">SoundCloud</p><p className="text-xs text-zinc-500">Downloader</p></div>
+          <div><p className="font-semibold tracking-tight text-white">SC-dlp</p><p className="text-xs text-zinc-500">by Unknown Garage Fighter</p></div>
         </div>
         <nav className="flex gap-1 overflow-x-auto px-3 pb-3 md:block md:space-y-1 md:px-3 md:py-5">
           {nav.map(({ to, label, icon: NavIcon }) => (
@@ -667,7 +773,7 @@ export default function App() {
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
           <footer className="mt-8 border-t border-white/[.06] pt-4 text-xs text-zinc-700">
-            SoundCloud Downloader · 저장 권한이 있는 공개 콘텐츠만
+            SC-dlp · by Unknown Garage Fighter
           </footer>
         </main>
       </div>

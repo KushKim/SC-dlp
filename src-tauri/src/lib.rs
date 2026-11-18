@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Condvar, Mutex,
+        mpsc, Condvar, Mutex,
     },
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -23,6 +23,7 @@ static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
     pub download_directory: String,
+    pub yt_dlp_path: String,
     pub audio_format: String,
     pub audio_quality: String,
     pub max_concurrent: usize,
@@ -35,6 +36,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             download_directory: default_download_directory().to_string_lossy().into_owned(),
+            yt_dlp_path: String::new(),
             audio_format: "original".into(),
             audio_quality: "192".into(),
             max_concurrent: 2,
@@ -52,6 +54,10 @@ impl AppSettings {
         }
         if !Path::new(&self.download_directory).is_absolute() {
             return Err("다운로드 폴더는 절대 경로여야 합니다.".into());
+        }
+        if !self.yt_dlp_path.trim().is_empty() && !Path::new(self.yt_dlp_path.trim()).is_absolute()
+        {
+            return Err("yt-dlp 실행 파일 경로는 절대 경로여야 합니다.".into());
         }
         if !matches!(self.audio_format.as_str(), "original" | "mp3") {
             return Err("지원하지 않는 오디오 형식입니다.".into());
@@ -96,6 +102,23 @@ pub struct TrackMetadata {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PlaylistAnalysis {
+    pub tracks: Vec<TrackMetadata>,
+    pub total_entries: usize,
+    pub skipped_entries: usize,
+    pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisProgress {
+    id: String,
+    processed: usize,
+    total: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DownloadJob {
     pub id: String,
     pub url: String,
@@ -128,6 +151,9 @@ struct AppState {
     store_path: PathBuf,
     store: Mutex<Store>,
     children: Mutex<HashMap<String, Child>>,
+    analysis_children: Mutex<HashMap<String, Child>>,
+    active_analyses: Mutex<HashSet<String>>,
+    cancelled_analyses: Mutex<HashSet<String>>,
     active_workers: Mutex<HashSet<String>>,
     shutting_down: AtomicBool,
     slot_changed: Condvar,
@@ -161,6 +187,9 @@ impl AppState {
             store_path,
             store: Mutex::new(store),
             children: Mutex::new(HashMap::new()),
+            analysis_children: Mutex::new(HashMap::new()),
+            active_analyses: Mutex::new(HashSet::new()),
+            cancelled_analyses: Mutex::new(HashSet::new()),
             active_workers: Mutex::new(HashSet::new()),
             shutting_down: AtomicBool::new(false),
             slot_changed: Condvar::new(),
@@ -299,6 +328,21 @@ impl AppState {
             }
         }
         children.clear();
+        if let Ok(mut children) = self.analysis_children.lock() {
+            for (id, child) in children.iter_mut() {
+                match terminate_child_tree(child) {
+                    Ok(()) => {
+                        if let Err(error) = child.wait() {
+                            eprintln!("Failed to wait for playlist analysis {id}: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to stop playlist analysis {id}: {error}");
+                    }
+                }
+            }
+            children.clear();
+        }
     }
 }
 
@@ -308,6 +352,13 @@ impl Drop for AppState {
             for (id, child) in children {
                 if let Err(error) = terminate_child_tree(child) {
                     eprintln!("Failed to stop download process {id} during shutdown: {error}");
+                }
+            }
+            if let Ok(children) = self.analysis_children.get_mut() {
+                for (id, child) in children {
+                    if let Err(error) = terminate_child_tree(child) {
+                        eprintln!("Failed to stop playlist analysis {id}: {error}");
+                    }
                 }
             }
         }
@@ -411,7 +462,19 @@ fn validate_soundcloud_url(value: &str) -> Result<String, String> {
     Ok(parsed.to_string())
 }
 
-fn yt_dlp_executable() -> Result<PathBuf, String> {
+fn yt_dlp_executable(configured_path: &str) -> Result<PathBuf, String> {
+    let configured_path = configured_path.trim();
+    if !configured_path.is_empty() {
+        let configured = PathBuf::from(configured_path);
+        if !configured.is_absolute() {
+            return Err("yt-dlp 실행 파일 경로는 절대 경로여야 합니다.".into());
+        }
+        if !configured.is_file() {
+            return Err("설정한 yt-dlp 실행 파일을 찾을 수 없습니다.".into());
+        }
+        return Ok(configured);
+    }
+
     #[cfg(windows)]
     let names = ["yt-dlp.exe", "yt-dlp"];
     #[cfg(not(windows))]
@@ -448,45 +511,391 @@ fn error_excerpt(output: &[u8]) -> String {
         .join("\n")
 }
 
-#[tauri::command]
-async fn analyze_url(url: String) -> Result<Vec<TrackMetadata>, String> {
-    tauri::async_runtime::spawn_blocking(move || analyze_url_blocking(url))
-        .await
-        .map_err(|error| format!("메타데이터 분석 작업을 실행하지 못했습니다: {error}"))?
-}
-
-fn metadata_arguments(url: &str) -> [&str; 6] {
+fn metadata_arguments(url: &str) -> [&str; 5] {
     [
         "--ignore-config",
-        "--no-warnings",
         "--skip-download",
-        "--dump-single-json",
+        "--dump-json",
         "--",
         url,
     ]
 }
 
-fn analyze_url_blocking(url: String) -> Result<Vec<TrackMetadata>, String> {
-    let url = validate_soundcloud_url(&url)?;
-    let output = Command::new(yt_dlp_executable()?)
-        .args(metadata_arguments(&url))
-        .output()
-        .map_err(|error| format!("yt-dlp 메타데이터 분석을 시작할 수 없습니다: {error}"))?;
+const MAX_ANALYSIS_ENTRIES: usize = 20_000;
 
-    if !output.status.success() {
-        let details = error_excerpt(&output.stderr);
-        return Err(if details.is_empty() {
-            format!("yt-dlp 분석이 종료 코드 {}로 실패했습니다.", output.status)
-        } else {
-            format!("yt-dlp 분석에 실패했습니다:\n{details}")
-        });
-    }
-
-    let root: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("yt-dlp가 올바른 JSON을 반환하지 않았습니다: {error}"))?;
-    parse_tracks(&root)
+enum AnalysisMessage {
+    Stdout(String),
+    Stderr(String),
+    StdoutClosed,
+    StderrClosed,
+    ReadError(String),
 }
 
+fn number_field(value: &serde_json::Value, field: &str) -> Option<usize> {
+    value.get(field).and_then(|value| {
+        value
+            .as_u64()
+            .map(|number| number as usize)
+            .or_else(|| value.as_str().and_then(|number| number.parse().ok()))
+    })
+}
+
+fn playlist_progress_from_line(line: &str) -> Option<(usize, usize)> {
+    let progress = line.split_once("Downloading item ")?.1;
+    let (processed, total) = progress.split_once(" of ")?;
+    Some((processed.trim().parse().ok()?, total.trim().parse().ok()?))
+}
+
+#[tauri::command]
+async fn analyze_url(id: String, url: String, app: AppHandle) -> Result<PlaylistAnalysis, String> {
+    if id.trim().is_empty() || id.len() > 128 {
+        return Err("분석 작업 식별자가 올바르지 않습니다.".into());
+    }
+    {
+        let state = app.state::<AppState>();
+        let mut active = state
+            .active_analyses
+            .lock()
+            .map_err(|_| "플레이리스트 분석 잠금에 실패했습니다.".to_string())?;
+        if !active.insert(id.clone()) {
+            return Err("같은 플레이리스트 분석이 이미 실행 중입니다.".into());
+        }
+    }
+
+    let blocking_app = app.clone();
+    let analysis_id = id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = blocking_app.state::<AppState>();
+        analyze_url_blocking(&blocking_app, &state, analysis_id, url)
+    })
+    .await
+    .map_err(|error| format!("메타데이터 분석 작업을 실행하지 못했습니다: {error}"))
+    .and_then(|result| result);
+
+    let state = app.state::<AppState>();
+    stop_analysis(&state, &id);
+    match state.active_analyses.lock() {
+        Ok(mut active) => {
+            active.remove(&id);
+        }
+        Err(_) => eprintln!("Failed to clear active playlist analysis {id}"),
+    }
+    match state.cancelled_analyses.lock() {
+        Ok(mut cancelled) => {
+            cancelled.remove(&id);
+        }
+        Err(_) => eprintln!("Failed to clear cancelled playlist analysis {id}"),
+    }
+    result
+}
+
+#[tauri::command]
+fn cancel_playlist_analysis(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let active = state
+        .active_analyses
+        .lock()
+        .map_err(|_| "플레이리스트 분석 상태를 확인할 수 없습니다.".to_string())?
+        .contains(&id);
+    if !active {
+        return Err("실행 중인 플레이리스트 분석을 찾을 수 없습니다.".into());
+    }
+
+    state
+        .cancelled_analyses
+        .lock()
+        .map_err(|_| "분석 취소 상태를 저장할 수 없습니다.".to_string())?
+        .insert(id.clone());
+    let mut children = state
+        .analysis_children
+        .lock()
+        .map_err(|_| "분석 프로세스 잠금에 실패했습니다.".to_string())?;
+    if let Some(child) = children.get_mut(&id) {
+        terminate_child_tree(child)?;
+    }
+    Ok(())
+}
+
+fn stop_analysis(state: &AppState, id: &str) {
+    let Ok(mut children) = state.analysis_children.lock() else {
+        eprintln!("Failed to lock playlist analysis process during cleanup");
+        return;
+    };
+    if let Some(mut child) = children.remove(id) {
+        if let Err(error) = terminate_child_tree(&mut child) {
+            eprintln!("Failed to stop playlist analysis {id}: {error}");
+        }
+        if let Err(error) = child.wait() {
+            eprintln!("Failed to wait for playlist analysis {id}: {error}");
+        }
+    }
+}
+
+fn analyze_url_blocking(
+    app: &AppHandle,
+    state: &AppState,
+    id: String,
+    url: String,
+) -> Result<PlaylistAnalysis, String> {
+    let url = validate_soundcloud_url(&url)?;
+    let yt_dlp_path = state
+        .store
+        .lock()
+        .map_err(|_| "앱 설정 잠금에 실패했습니다.".to_string())?
+        .settings
+        .yt_dlp_path
+        .clone();
+    let mut command = Command::new(yt_dlp_executable(&yt_dlp_path)?);
+    command
+        .args(metadata_arguments(&url))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("yt-dlp 메타데이터 분석을 시작할 수 없습니다: {error}"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = terminate_child_tree(&mut child);
+            return Err("yt-dlp 분석 출력을 읽을 수 없습니다.".into());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = terminate_child_tree(&mut child);
+            return Err("yt-dlp 분석 오류 출력을 읽을 수 없습니다.".into());
+        }
+    };
+
+    match state.analysis_children.lock() {
+        Ok(mut children) => {
+            children.insert(id.clone(), child);
+        }
+        Err(_) => {
+            let mut child = child;
+            let _ = terminate_child_tree(&mut child);
+            return Err("분석 프로세스 잠금에 실패했습니다.".into());
+        }
+    }
+
+    let processing = (|| -> Result<PlaylistAnalysis, String> {
+        let cancelled_before_start = state
+            .cancelled_analyses
+            .lock()
+            .map_err(|_| "분석 취소 상태 잠금에 실패했습니다.".to_string())?
+            .contains(&id);
+        if cancelled_before_start {
+            if let Ok(mut children) = state.analysis_children.lock() {
+                if let Some(child) = children.get_mut(&id) {
+                    let _ = terminate_child_tree(child);
+                }
+            }
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let stdout_sender = sender.clone();
+        thread::Builder::new()
+            .name(format!("playlist-out-{id}"))
+            .spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    match line {
+                        Ok(line) => {
+                            if stdout_sender.send(AnalysisMessage::Stdout(line)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = stdout_sender.send(AnalysisMessage::ReadError(format!(
+                                "yt-dlp 분석 출력을 읽지 못했습니다: {error}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+                let _ = stdout_sender.send(AnalysisMessage::StdoutClosed);
+            })
+            .map_err(|error| format!("플레이리스트 출력 처리를 시작하지 못했습니다: {error}"))?;
+        let stderr_sender = sender.clone();
+        thread::Builder::new()
+            .name(format!("playlist-err-{id}"))
+            .spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    match line {
+                        Ok(line) => {
+                            if stderr_sender.send(AnalysisMessage::Stderr(line)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = stderr_sender.send(AnalysisMessage::ReadError(format!(
+                                "yt-dlp 분석 오류 출력을 읽지 못했습니다: {error}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+                let _ = stderr_sender.send(AnalysisMessage::StderrClosed);
+            })
+            .map_err(|error| format!("플레이리스트 오류 처리를 시작하지 못했습니다: {error}"))?;
+        drop(sender);
+
+        let mut tracks = Vec::new();
+        let mut seen_entries = 0usize;
+        let mut processed = 0usize;
+        let mut reported_total = None;
+        let mut stderr_lines = Vec::new();
+        let mut read_error = None;
+        let mut closed_streams = 0;
+        while closed_streams < 2 {
+            let message = receiver
+                .recv()
+                .map_err(|error| format!("yt-dlp 분석 결과를 받지 못했습니다: {error}"))?;
+            match message {
+                AnalysisMessage::Stdout(line) if !line.trim().is_empty() => {
+                    let entry: serde_json::Value =
+                        serde_json::from_str(&line).map_err(|error| {
+                            format!("yt-dlp 트랙 메타데이터가 올바른 JSON이 아닙니다: {error}")
+                        })?;
+                    seen_entries = seen_entries.saturating_add(1);
+                    processed = processed.max(seen_entries);
+                    reported_total = reported_total
+                        .into_iter()
+                        .chain(number_field(&entry, "playlist_count"))
+                        .max();
+                    if let Some(track) = parse_track(&entry) {
+                        tracks.push(track);
+                    }
+                    if seen_entries > MAX_ANALYSIS_ENTRIES {
+                        return Err(format!(
+                            "플레이리스트가 최대 분석 항목 수({MAX_ANALYSIS_ENTRIES})를 초과했습니다."
+                        ));
+                    }
+                    emit_analysis_progress(app, &id, processed, reported_total.or(Some(processed)));
+                }
+                AnalysisMessage::Stdout(_) => {}
+                AnalysisMessage::Stderr(line) => {
+                    if let Some((reported_processed, total)) = playlist_progress_from_line(&line) {
+                        processed = processed.max(reported_processed);
+                        reported_total = Some(reported_total.unwrap_or_default().max(total));
+                        emit_analysis_progress(app, &id, processed, reported_total);
+                    }
+                    if !line.trim().is_empty() {
+                        if stderr_lines.len() == 32 {
+                            stderr_lines.remove(0);
+                        }
+                        stderr_lines.push(line);
+                    }
+                }
+                AnalysisMessage::StdoutClosed | AnalysisMessage::StderrClosed => {
+                    closed_streams += 1;
+                }
+                AnalysisMessage::ReadError(error) => read_error = Some(error),
+            }
+        }
+
+        let mut child = state
+            .analysis_children
+            .lock()
+            .map_err(|_| "분석 프로세스 잠금에 실패했습니다.".to_string())?
+            .remove(&id)
+            .ok_or_else(|| "yt-dlp 분석 프로세스를 찾을 수 없습니다.".to_string())?;
+        let status = child
+            .wait()
+            .map_err(|error| format!("yt-dlp 분석 종료 상태를 확인하지 못했습니다: {error}"))?;
+        let was_cancelled = state
+            .cancelled_analyses
+            .lock()
+            .map_err(|_| "분석 취소 상태 잠금에 실패했습니다.".to_string())?
+            .contains(&id);
+        if was_cancelled {
+            return Err("플레이리스트 분석을 취소했습니다.".into());
+        }
+        if let Some(error) = read_error {
+            return Err(error);
+        }
+        if tracks.is_empty() {
+            if !status.success() {
+                let details = error_excerpt(stderr_lines.join("\n").as_bytes());
+                return Err(if details.is_empty() {
+                    format!("yt-dlp 분석이 종료 코드 {status}로 실패했습니다.")
+                } else {
+                    format!("yt-dlp 분석에 실패했습니다:\n{details}")
+                });
+            }
+            return Err("공개 SoundCloud 트랙을 찾지 못했습니다.".into());
+        }
+        let total_entries = reported_total.unwrap_or(seen_entries).max(seen_entries);
+        let skipped_entries = total_entries.saturating_sub(tracks.len());
+        let warning = if status.success() {
+            None
+        } else {
+            let details = error_excerpt(stderr_lines.join("\n").as_bytes());
+            Some(if details.is_empty() {
+                format!(
+                    "yt-dlp가 종료 코드 {status}로 끝났습니다. 일부 항목이 누락되었을 수 있습니다."
+                )
+            } else {
+                format!("일부 트랙을 분석하지 못했습니다:\n{details}")
+            })
+        };
+        Ok(PlaylistAnalysis {
+            tracks,
+            total_entries,
+            skipped_entries,
+            warning,
+        })
+    })();
+    if processing.is_err() {
+        stop_analysis(state, &id);
+    }
+    processing
+}
+
+fn emit_analysis_progress(app: &AppHandle, id: &str, processed: usize, total: Option<usize>) {
+    if let Err(error) = app.emit(
+        "playlist-analysis-progress",
+        AnalysisProgress {
+            id: id.to_string(),
+            processed,
+            total,
+        },
+    ) {
+        eprintln!("Failed to emit playlist-analysis-progress event: {error}");
+    }
+}
+
+fn parse_track(entry: &serde_json::Value) -> Option<TrackMetadata> {
+    let title = entry
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())?;
+    let track_url = ["webpage_url", "original_url", "url"]
+        .iter()
+        .filter_map(|field| entry.get(field).and_then(serde_json::Value::as_str))
+        .find_map(|candidate| validate_soundcloud_url(candidate).ok())?;
+
+    Some(TrackMetadata {
+        url: track_url,
+        title: title.to_string(),
+        source_id: entry.get("id").and_then(|id| {
+            id.as_str()
+                .map(str::to_string)
+                .or_else(|| id.as_u64().map(|id| id.to_string()))
+        }),
+        artist: entry
+            .get("artist")
+            .or_else(|| entry.get("uploader"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        duration: entry.get("duration").and_then(serde_json::Value::as_u64),
+        selected: false,
+    })
+}
+
+#[cfg(test)]
 fn parse_tracks(root: &serde_json::Value) -> Result<Vec<TrackMetadata>, String> {
     let entries: Vec<&serde_json::Value> =
         match root.get("entries").and_then(serde_json::Value::as_array) {
@@ -496,38 +905,9 @@ fn parse_tracks(root: &serde_json::Value) -> Result<Vec<TrackMetadata>, String> 
 
     let mut tracks = Vec::new();
     for entry in entries {
-        let title = entry
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|title| !title.is_empty());
-        let Some(title) = title else {
-            continue;
-        };
-        let track_url = ["webpage_url", "original_url", "url"]
-            .iter()
-            .filter_map(|field| entry.get(field).and_then(serde_json::Value::as_str))
-            .find_map(|candidate| validate_soundcloud_url(candidate).ok());
-        let Some(track_url) = track_url else {
-            continue;
-        };
-
-        tracks.push(TrackMetadata {
-            url: track_url,
-            title: title.to_string(),
-            source_id: entry.get("id").and_then(|id| {
-                id.as_str()
-                    .map(str::to_string)
-                    .or_else(|| id.as_u64().map(|id| id.to_string()))
-            }),
-            artist: entry
-                .get("artist")
-                .or_else(|| entry.get("uploader"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            duration: entry.get("duration").and_then(serde_json::Value::as_u64),
-            selected: false,
-        });
+        if let Some(track) = parse_track(entry) {
+            tracks.push(track);
+        }
     }
     if tracks.is_empty() {
         return Err("공개 SoundCloud 트랙을 찾지 못했습니다.".into());
@@ -698,7 +1078,7 @@ fn execute_download(
         safe_filename_component(job.source_id.as_deref().unwrap_or(&job.id), 40)
     );
     let output_template = directory.join(format!("{filename}.%(ext)s"));
-    let mut command = Command::new(yt_dlp_executable()?);
+    let mut command = Command::new(yt_dlp_executable(&settings.yt_dlp_path)?);
     command
         .args([
             "--ignore-config",
@@ -998,6 +1378,15 @@ fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 #[tauri::command]
 fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<AppSettings, String> {
     settings.validate()?;
+    if !settings.yt_dlp_path.trim().is_empty() {
+        let executable = yt_dlp_executable(&settings.yt_dlp_path)?;
+        let status = inspect_executable(&executable, "--version");
+        if !status.available {
+            return Err(status
+                .error
+                .unwrap_or_else(|| "설정한 yt-dlp 실행 파일을 확인할 수 없습니다.".into()));
+        }
+    }
     let mut store = state
         .store
         .lock()
@@ -1012,16 +1401,36 @@ fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<Ap
 }
 
 #[tauri::command]
-fn get_engine_status() -> EngineStatus {
+fn get_engine_status(state: State<'_, AppState>) -> Result<EngineStatus, String> {
     #[cfg(windows)]
     let (yt_dlp_names, ffmpeg_names) = (["yt-dlp.exe", "yt-dlp"], ["ffmpeg.exe", "ffmpeg"]);
     #[cfg(not(windows))]
     let (yt_dlp_names, ffmpeg_names) = (["yt-dlp", "yt-dlp"], ["ffmpeg", "ffmpeg"]);
 
-    EngineStatus {
-        yt_dlp: inspect_tool(&yt_dlp_names, "--version"),
+    let configured_path = state
+        .store
+        .lock()
+        .map_err(|_| "앱 설정 잠금에 실패했습니다.".to_string())?
+        .settings
+        .yt_dlp_path
+        .clone();
+    let yt_dlp = if configured_path.trim().is_empty() {
+        inspect_tool(&yt_dlp_names, "--version")
+    } else {
+        match yt_dlp_executable(&configured_path) {
+            Ok(path) => inspect_executable(&path, "--version"),
+            Err(error) => ToolStatus {
+                available: false,
+                version: None,
+                error: Some(error),
+            },
+        }
+    };
+
+    Ok(EngineStatus {
+        yt_dlp,
         ffmpeg: inspect_tool(&ffmpeg_names, "-version"),
-    }
+    })
 }
 
 #[tauri::command]
@@ -1300,6 +1709,7 @@ pub fn run() {
             save_settings,
             get_engine_status,
             analyze_url,
+            cancel_playlist_analysis,
             get_download_jobs,
             queue_downloads,
             cancel_download,
@@ -1324,9 +1734,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        inspect_executable, metadata_arguments, parse_tracks, resolve_library_file,
-        safe_filename_component, validate_soundcloud_url, AppSettings, AppState, DownloadJob,
-        JobStatus,
+        inspect_executable, metadata_arguments, parse_tracks, playlist_progress_from_line,
+        resolve_library_file, safe_filename_component, validate_soundcloud_url, yt_dlp_executable,
+        AppSettings, AppState, DownloadJob, JobStatus,
     };
     use std::{fs, path::PathBuf};
 
@@ -1348,6 +1758,9 @@ mod tests {
         assert!(settings.validate().is_err());
         settings.audio_quality = "192".into();
         settings.audio_format = "wav".into();
+        assert!(settings.validate().is_err());
+        settings.audio_format = "original".into();
+        settings.yt_dlp_path = "yt-dlp.exe".into();
         assert!(settings.validate().is_err());
     }
 
@@ -1431,8 +1844,37 @@ mod tests {
         let arguments = metadata_arguments("https://soundcloud.com/artist/sets/playlist");
 
         assert!(arguments.contains(&"--skip-download"));
+        assert!(arguments.contains(&"--dump-json"));
         assert!(!arguments.contains(&"--flat-playlist"));
-        assert_eq!(arguments[5], "https://soundcloud.com/artist/sets/playlist");
+        assert_eq!(arguments[4], "https://soundcloud.com/artist/sets/playlist");
+    }
+
+    #[test]
+    fn playlist_analysis_progress_parses_yt_dlp_item_status() {
+        assert_eq!(
+            playlist_progress_from_line("[download] Downloading item 12 of 340"),
+            Some((12, 340))
+        );
+        assert_eq!(
+            playlist_progress_from_line("[info] resolving playlist"),
+            None
+        );
+    }
+
+    #[test]
+    fn configured_yt_dlp_path_is_used_and_must_exist() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("custom-yt-dlp");
+        fs::write(&executable, "tool").unwrap();
+
+        assert_eq!(
+            yt_dlp_executable(executable.to_str().unwrap()).unwrap(),
+            executable
+        );
+        assert!(yt_dlp_executable("relative/yt-dlp").is_err());
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
