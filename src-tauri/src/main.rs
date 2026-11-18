@@ -1,1 +1,3 @@
-fn main() { soundcloud_downloader_lib::run(); }
+fn main() {
+    soundcloud_downloader_lib::run();
+}
