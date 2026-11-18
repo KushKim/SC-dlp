@@ -357,7 +357,7 @@ fn locate_executable(names: &[&str]) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn inspect_tool(names: &[&str]) -> ToolStatus {
+fn inspect_tool(names: &[&str], version_argument: &str) -> ToolStatus {
     let Some(executable) = locate_executable(names) else {
         return ToolStatus {
             available: false,
@@ -365,8 +365,11 @@ fn inspect_tool(names: &[&str]) -> ToolStatus {
             error: Some("실행 파일을 PATH에서 찾지 못했습니다.".into()),
         };
     };
+    inspect_executable(&executable, version_argument)
+}
 
-    match Command::new(executable).arg("--version").output() {
+fn inspect_executable(executable: &Path, version_argument: &str) -> ToolStatus {
+    match Command::new(executable).arg(version_argument).output() {
         Ok(output) if output.status.success() => ToolStatus {
             available: true,
             version: Some(String::from_utf8_lossy(&output.stdout).trim().to_string()),
@@ -1013,8 +1016,8 @@ fn get_engine_status() -> EngineStatus {
     let (yt_dlp_names, ffmpeg_names) = (["yt-dlp", "yt-dlp"], ["ffmpeg", "ffmpeg"]);
 
     EngineStatus {
-        yt_dlp: inspect_tool(&yt_dlp_names),
-        ffmpeg: inspect_tool(&ffmpeg_names),
+        yt_dlp: inspect_tool(&yt_dlp_names, "--version"),
+        ffmpeg: inspect_tool(&ffmpeg_names, "-version"),
     }
 }
 
@@ -1318,8 +1321,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_tracks, resolve_library_file, safe_filename_component, validate_soundcloud_url,
-        AppSettings, AppState, DownloadJob, JobStatus,
+        inspect_executable, parse_tracks, resolve_library_file, safe_filename_component,
+        validate_soundcloud_url, AppSettings, AppState, DownloadJob, JobStatus,
     };
     use std::{fs, path::PathBuf};
 
@@ -1348,6 +1351,29 @@ mod tests {
     fn settings_accept_supported_values() {
         let settings = AppSettings::default();
         assert!(settings.validate().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ffmpeg_version_check_uses_single_dash_argument() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("ffmpeg");
+        fs::write(
+            &executable,
+            "#!/bin/sh\n[ \"$1\" = \"-version\" ] || { echo \"Unrecognized option '$1'\" >&2; exit 1; }\necho 'ffmpeg version test'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let status = inspect_executable(&executable, "-version");
+        assert!(status.available);
+        assert_eq!(status.version.as_deref(), Some("ffmpeg version test"));
+        assert!(status.error.is_none());
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
