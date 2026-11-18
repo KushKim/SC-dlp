@@ -725,7 +725,7 @@ export default function App() {
       <aside className="flex shrink-0 flex-col border-b border-white/[.07] bg-[#0e0e14] md:sticky md:top-0 md:h-screen md:w-64 md:border-b-0 md:border-r">
         <div className="flex items-center gap-3 px-5 py-5">
           <div className="grid h-10 w-10 place-items-center rounded-xl bg-brand text-white"><Disc3 size={22} /></div>
-          <div><p className="font-semibold tracking-tight text-white">SoundCloud</p><p className="text-xs text-zinc-500">Downloader</p></div>
+          <div><p className="font-semibold tracking-tight text-white">SC-dlp</p><p className="text-xs text-zinc-500">by Unknown Garage Fighter</p></div>
         </div>
         <nav className="flex gap-1 overflow-x-auto px-3 pb-3 md:block md:space-y-1 md:px-3 md:py-5">
           {nav.map(({ to, label, icon: NavIcon }) => (
