@@ -224,7 +224,7 @@ function Playlist() {
             {loading ? '메타데이터 분석 중' : 'URL 분석'}
           </button>
         </div>
-        <p className="mt-3 text-xs text-zinc-500">메타데이터 분석과 오디오 파일 다운로드는 별도 단계입니다. 분석만으로 파일을 저장하지 않습니다.</p>
+        <p className="mt-3 text-xs text-zinc-500">플레이리스트의 전체 트랙 정보를 분석합니다. 분석만으로 파일을 저장하지 않으며, 전체 선택 또는 원하는 트랙을 선택해 대기열에 추가하세요.</p>
       </Card>
       {error && <p role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">{error}</p>}
       {message && <p role="status" className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-300">{message}</p>}

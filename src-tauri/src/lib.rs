@@ -455,18 +455,21 @@ async fn analyze_url(url: String) -> Result<Vec<TrackMetadata>, String> {
         .map_err(|error| format!("메타데이터 분석 작업을 실행하지 못했습니다: {error}"))?
 }
 
+fn metadata_arguments(url: &str) -> [&str; 6] {
+    [
+        "--ignore-config",
+        "--no-warnings",
+        "--skip-download",
+        "--dump-single-json",
+        "--",
+        url,
+    ]
+}
+
 fn analyze_url_blocking(url: String) -> Result<Vec<TrackMetadata>, String> {
     let url = validate_soundcloud_url(&url)?;
     let output = Command::new(yt_dlp_executable()?)
-        .args([
-            "--ignore-config",
-            "--no-warnings",
-            "--flat-playlist",
-            "--skip-download",
-            "--dump-single-json",
-            "--",
-            &url,
-        ])
+        .args(metadata_arguments(&url))
         .output()
         .map_err(|error| format!("yt-dlp 메타데이터 분석을 시작할 수 없습니다: {error}"))?;
 
@@ -1321,8 +1324,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        inspect_executable, parse_tracks, resolve_library_file, safe_filename_component,
-        validate_soundcloud_url, AppSettings, AppState, DownloadJob, JobStatus,
+        inspect_executable, metadata_arguments, parse_tracks, resolve_library_file,
+        safe_filename_component, validate_soundcloud_url, AppSettings, AppState, DownloadJob,
+        JobStatus,
     };
     use std::{fs, path::PathBuf};
 
@@ -1397,6 +1401,13 @@ mod tests {
                     "webpage_url": "https://soundcloud.com/artist/track"
                 },
                 {
+                    "id": "456",
+                    "title": "Second Track",
+                    "uploader": "Artist",
+                    "webpage_url": "https://soundcloud.com/artist/second-track",
+                    "url": "https://playback.media-streaming.soundcloud.cloud/track"
+                },
+                {
                     "id": "bad",
                     "title": "Not SoundCloud",
                     "webpage_url": "https://example.org/track"
@@ -1405,11 +1416,23 @@ mod tests {
         });
 
         let tracks = parse_tracks(&response).unwrap();
-        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].source_id.as_deref(), Some("123"));
         assert_eq!(tracks[0].artist.as_deref(), Some("Artist"));
         assert_eq!(tracks[0].duration, Some(83));
         assert!(!tracks[0].selected);
+        assert_eq!(tracks[1].source_id.as_deref(), Some("456"));
+        assert_eq!(tracks[1].url, "https://soundcloud.com/artist/second-track");
+        assert!(!tracks[1].selected);
+    }
+
+    #[test]
+    fn playlist_analysis_arguments_resolve_track_metadata_without_downloading_audio() {
+        let arguments = metadata_arguments("https://soundcloud.com/artist/sets/playlist");
+
+        assert!(arguments.contains(&"--skip-download"));
+        assert!(!arguments.contains(&"--flat-playlist"));
+        assert_eq!(arguments[5], "https://soundcloud.com/artist/sets/playlist");
     }
 
     #[test]

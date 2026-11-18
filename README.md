@@ -4,7 +4,7 @@ Tauri 2 + React + TypeScript 데스크톱 앱입니다. 사용자가 저장 권�
 
 ## 현재 기능
 
-- HTTPS `soundcloud.com` URL만 허용하고 yt-dlp로 공개 메타데이터를 분석합니다.
+- HTTPS `soundcloud.com` URL만 허용하고 yt-dlp로 공개 트랙/플레이리스트의 전체 트랙 메타데이터를 분석합니다.
 - 트랙은 기본적으로 선택 해제되어 있습니다. 사용자가 선택한 트랙만 대기열에 추가됩니다.
 - 대기열은 `queued`, `downloading`, `completed`, `failed`, `cancelled` 상태를 저장하며 진행률·속도·남은 시간·오류를 표시합니다.
 - 개별/전체 취소와 실패·취소 작업 재시도를 지원합니다. 실행 중이던 작업은 앱을 다시 열면 중단 기록으로 복구됩니다.
