@@ -60,13 +60,13 @@ jobs:
           if ($installers.Count -ne 1) {
             throw "Expected one NSIS installer, found $($installers.Count)."
           }
-          Copy-Item $installers[0].FullName "SoundCloudDownloader_Setup.exe"
+          Copy-Item $installers[0].FullName "SC-dlp_Setup.exe"
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SoundCloudDownloader-Setup
-          path: SoundCloudDownloader_Setup.exe
+          name: SC-dlp-Setup
+          path: SC-dlp_Setup.exe
           if-no-files-found: error
 
   release:
@@ -79,11 +79,11 @@ jobs:
       - name: Download installer artifact
         uses: actions/download-artifact@v4
         with:
-          name: SoundCloudDownloader-Setup
+          name: SC-dlp-Setup
           path: release
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/SoundCloudDownloader_Setup.exe
+          files: release/SC-dlp_Setup.exe
           fail_on_unmatched_files: true
