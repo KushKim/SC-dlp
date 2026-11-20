@@ -36,13 +36,14 @@ type AppSettings = {
 type ToolStatus = { available: boolean; version: string | null; error: string | null };
 type EngineStatus = { ytDlp: ToolStatus; ffmpeg: ToolStatus };
 type TrackMetadata = { url: string; title: string; sourceId: string | null; artist: string | null; duration: number | null; selected: boolean };
-type PlaylistAnalysis = { tracks: TrackMetadata[]; totalEntries: number; skippedEntries: number; warning: string | null };
+type PlaylistAnalysis = { tracks: TrackMetadata[]; playlistName: string | null; totalEntries: number; skippedEntries: number; warning: string | null };
 type AnalysisProgress = { id: string; processed: number; total: number | null };
 type JobStatus = 'queued' | 'downloading' | 'completed' | 'failed' | 'cancelled';
 type DownloadJob = {
   id: string;
   url: string;
   title: string;
+  playlistName: string | null;
   sourceId: string | null;
   artist: string | null;
   duration: number | null;
@@ -171,6 +172,7 @@ function Playlist() {
   const navigate = useNavigate();
   const [url, setUrl] = useState('');
   const [tracks, setTracks] = useState<TrackMetadata[]>([]);
+  const [playlistName, setPlaylistName] = useState<string | null>(null);
   const [analysisSummary, setAnalysisSummary] = useState<{ totalEntries: number; skippedEntries: number; warning: string | null } | null>(null);
   const [loading, setLoading] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -190,6 +192,7 @@ function Playlist() {
     setError('');
     setMessage('');
     setTracks([]);
+    setPlaylistName(null);
     setAnalysisSummary(null);
     setPage(0);
     setAnalysisProgress(null);
@@ -204,6 +207,7 @@ function Playlist() {
       });
       const result = await invoke<PlaylistAnalysis>('analyze_url', { id, url });
       setTracks(result.tracks);
+      setPlaylistName(result.playlistName);
       setAnalysisSummary({ totalEntries: result.totalEntries, skippedEntries: result.skippedEntries, warning: result.warning });
     } catch (cause) {
       if (cancelRequested.current) setMessage('플레이리스트 분석을 취소했습니다.');
@@ -235,7 +239,7 @@ function Playlist() {
     setError('');
     setMessage('');
     try {
-      const jobs = await invoke<DownloadJob[]>('queue_downloads', { tracks });
+      const jobs = await invoke<DownloadJob[]>('queue_downloads', { tracks, playlistName });
       setMessage(`${jobs.length}개 작업을 대기열에 추가했습니다.`);
       navigate('/downloads');
     } catch (cause) {
@@ -298,6 +302,7 @@ function Playlist() {
               <p className="mt-1 text-sm text-zinc-500">
                 전체 {analysisSummary?.totalEntries ?? tracks.length}개 중 {tracks.length}개 확인 · 선택한 트랙만 큐에 추가됩니다.
               </p>
+              {playlistName && <p className="mt-1 text-xs text-zinc-500">다운로드 폴더: {playlistName}</p>}
             </div>
             <div className="flex flex-wrap gap-2">
               <button type="button" onClick={() => toggleAll(true)} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5">전체 선택</button>

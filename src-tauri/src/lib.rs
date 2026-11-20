@@ -104,6 +104,7 @@ pub struct TrackMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistAnalysis {
     pub tracks: Vec<TrackMetadata>,
+    pub playlist_name: Option<String>,
     pub total_entries: usize,
     pub skipped_entries: usize,
     pub warning: Option<String>,
@@ -123,6 +124,8 @@ pub struct DownloadJob {
     pub id: String,
     pub url: String,
     pub title: String,
+    #[serde(default)]
+    pub playlist_name: Option<String>,
     pub source_id: Option<String>,
     pub artist: Option<String>,
     pub duration: Option<u64>,
@@ -546,6 +549,25 @@ fn playlist_progress_from_line(line: &str) -> Option<(usize, usize)> {
     Some((processed.trim().parse().ok()?, total.trim().parse().ok()?))
 }
 
+fn playlist_name_from_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    let segments = parsed.path_segments()?.collect::<Vec<_>>();
+    let sets_index = segments.iter().position(|segment| *segment == "sets")?;
+    let slug = segments.get(sets_index + 1)?.trim();
+    if slug.is_empty() {
+        return None;
+    }
+    Some(slug.replace(['-', '_'], " "))
+}
+
+fn playlist_name_from_entry(entry: &serde_json::Value) -> Option<&str> {
+    ["playlist_title", "playlist"]
+        .iter()
+        .filter_map(|field| entry.get(field).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+}
+
 #[tauri::command]
 async fn analyze_url(id: String, url: String, app: AppHandle) -> Result<PlaylistAnalysis, String> {
     if id.trim().is_empty() || id.len() > 128 {
@@ -742,6 +764,7 @@ fn analyze_url_blocking(
         drop(sender);
 
         let mut tracks = Vec::new();
+        let mut playlist_name = playlist_name_from_url(&url);
         let mut seen_entries = 0usize;
         let mut processed = 0usize;
         let mut reported_total = None;
@@ -758,6 +781,9 @@ fn analyze_url_blocking(
                         serde_json::from_str(&line).map_err(|error| {
                             format!("yt-dlp 트랙 메타데이터가 올바른 JSON이 아닙니다: {error}")
                         })?;
+                    if let Some(name) = playlist_name_from_entry(&entry) {
+                        playlist_name = Some(name.to_string());
+                    }
                     seen_entries = seen_entries.saturating_add(1);
                     processed = processed.max(seen_entries);
                     reported_total = reported_total
@@ -842,6 +868,7 @@ fn analyze_url_blocking(
         };
         Ok(PlaylistAnalysis {
             tracks,
+            playlist_name,
             total_entries,
             skipped_entries,
             warning,
@@ -1061,9 +1088,19 @@ fn execute_download(
         .map_err(|_| "앱 설정 잠금에 실패했습니다.".to_string())?
         .settings
         .clone();
-    let directory = PathBuf::from(&settings.download_directory);
-    fs::create_dir_all(&directory)
+    let download_root = PathBuf::from(&settings.download_directory);
+    fs::create_dir_all(&download_root)
         .map_err(|error| format!("다운로드 폴더를 만들 수 없습니다: {error}"))?;
+    let download_root = fs::canonicalize(&download_root)
+        .map_err(|error| format!("다운로드 폴더 경로를 확인할 수 없습니다: {error}"))?;
+    let directory = download_output_directory(&download_root, job.playlist_name.as_deref());
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("플레이리스트 다운로드 폴더를 만들 수 없습니다: {error}"))?;
+    let directory = fs::canonicalize(directory)
+        .map_err(|error| format!("플레이리스트 다운로드 폴더를 확인할 수 없습니다: {error}"))?;
+    if !directory.starts_with(&download_root) {
+        return Err("플레이리스트 다운로드 폴더가 설정된 다운로드 위치를 벗어났습니다.".into());
+    }
 
     let needs_ffmpeg =
         settings.audio_format == "mp3" || settings.embed_artwork || settings.embed_metadata;
@@ -1328,13 +1365,26 @@ fn safe_filename_component(value: &str, max_chars: usize) -> String {
     if result.is_empty() {
         result = "Unknown".into();
     }
-    if matches!(
-        result.to_ascii_uppercase().as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "LPT1"
-    ) {
+    let device_name = result
+        .split('.')
+        .next()
+        .unwrap_or(&result)
+        .to_ascii_uppercase();
+    let numbered_device = device_name
+        .strip_prefix("COM")
+        .or_else(|| device_name.strip_prefix("LPT"))
+        .is_some_and(|number| number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'));
+    if matches!(device_name.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered_device {
         result.insert(0, '_');
     }
     result
+}
+
+fn download_output_directory(root: &Path, playlist_name: Option<&str>) -> PathBuf {
+    playlist_name
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| root.join(safe_filename_component(name, 100)))
+        .unwrap_or_else(|| root.to_path_buf())
 }
 
 fn find_output_file(directory: &Path, filename: &str) -> Option<PathBuf> {
@@ -1441,9 +1491,23 @@ fn get_download_jobs(state: State<'_, AppState>) -> Result<Vec<DownloadJob>, Str
 #[tauri::command]
 fn queue_downloads(
     tracks: Vec<TrackMetadata>,
+    playlist_name: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<DownloadJob>, String> {
+    let playlist_name = match playlist_name {
+        Some(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("플레이리스트 이름이 비어 있습니다.".into());
+            }
+            if name.chars().count() > 500 {
+                return Err("플레이리스트 이름이 너무 깁니다.".into());
+            }
+            Some(name.to_string())
+        }
+        None => None,
+    };
     let selected = tracks
         .into_iter()
         .filter(|track| track.selected)
@@ -1465,6 +1529,7 @@ fn queue_downloads(
             id: new_job_id(),
             url: track.url,
             title: track.title,
+            playlist_name: playlist_name.clone(),
             source_id: track.source_id,
             artist: track.artist,
             duration: track.duration,
@@ -1620,39 +1685,49 @@ fn resolve_library_file(state: &AppState, path: &str) -> Result<PathBuf, String>
 #[tauri::command]
 fn get_library_files(state: State<'_, AppState>) -> Result<Vec<LibraryFile>, String> {
     let directory = library_directory(&state)?;
-    let entries = fs::read_dir(&directory)
-        .map_err(|error| format!("라이브러리 폴더를 읽을 수 없습니다: {error}"))?;
+    collect_library_files(&directory)
+}
+
+fn collect_library_files(directory: &Path) -> Result<Vec<LibraryFile>, String> {
     let mut files = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| format!("라이브러리 항목을 읽을 수 없습니다: {error}"))?;
-        if !entry
-            .file_type()
-            .map_err(|error| format!("파일 종류를 확인할 수 없습니다: {error}"))?
-            .is_file()
-        {
-            continue;
+    let mut pending_directories = vec![directory.to_path_buf()];
+    while let Some(current_directory) = pending_directories.pop() {
+        let entries = fs::read_dir(&current_directory)
+            .map_err(|error| format!("라이브러리 폴더를 읽을 수 없습니다: {error}"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("라이브러리 항목을 읽을 수 없습니다: {error}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("파일 종류를 확인할 수 없습니다: {error}"))?;
+            if file_type.is_dir() {
+                pending_directories.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if !is_audio_file(&path) {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("파일 정보를 읽을 수 없습니다: {error}"))?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs());
+            files.push(LibraryFile {
+                path: path.to_string_lossy().into_owned(),
+                name: entry.file_name().to_string_lossy().into_owned(),
+                size: metadata.len(),
+                modified,
+            });
         }
-        let path = entry.path();
-        if !is_audio_file(&path) {
-            continue;
-        }
-        let metadata = entry
-            .metadata()
-            .map_err(|error| format!("파일 정보를 읽을 수 없습니다: {error}"))?;
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs());
-        files.push(LibraryFile {
-            path: path.to_string_lossy().into_owned(),
-            name: entry.file_name().to_string_lossy().into_owned(),
-            size: metadata.len(),
-            modified,
-        });
     }
-    files.sort_by_key(|file| file.name.to_lowercase());
+    files.sort_by_key(|file| (file.name.to_lowercase(), file.path.to_lowercase()));
     Ok(files)
 }
 
@@ -1734,9 +1809,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        inspect_executable, metadata_arguments, parse_tracks, playlist_progress_from_line,
-        resolve_library_file, safe_filename_component, validate_soundcloud_url, yt_dlp_executable,
-        AppSettings, AppState, DownloadJob, JobStatus,
+        collect_library_files, download_output_directory, inspect_executable, metadata_arguments,
+        parse_tracks, playlist_name_from_entry, playlist_name_from_url,
+        playlist_progress_from_line, resolve_library_file, safe_filename_component,
+        validate_soundcloud_url, yt_dlp_executable, AppSettings, AppState, DownloadJob, JobStatus,
     };
     use std::{fs, path::PathBuf};
 
@@ -1850,6 +1926,20 @@ mod tests {
     }
 
     #[test]
+    fn playlist_names_use_metadata_or_the_soundcloud_set_slug() {
+        let entry = serde_json::json!({ "playlist_title": "My Playlist" });
+        assert_eq!(playlist_name_from_entry(&entry), Some("My Playlist"));
+        assert_eq!(
+            playlist_name_from_url("https://soundcloud.com/artist/sets/my-playlist"),
+            Some("my playlist".into())
+        );
+        assert_eq!(
+            playlist_name_from_url("https://soundcloud.com/artist/track"),
+            None
+        );
+    }
+
+    #[test]
     fn playlist_analysis_progress_parses_yt_dlp_item_status() {
         assert_eq!(
             playlist_progress_from_line("[download] Downloading item 12 of 340"),
@@ -1881,7 +1971,18 @@ mod tests {
     fn filename_components_cannot_create_paths_or_windows_devices() {
         assert_eq!(safe_filename_component("../track:one", 100), "_track_one");
         assert_eq!(safe_filename_component("CON", 100), "_CON");
+        assert_eq!(safe_filename_component("COM2.txt", 100), "_COM2.txt");
         assert_eq!(safe_filename_component("...", 100), "Unknown");
+    }
+
+    #[test]
+    fn playlist_output_directories_stay_under_the_download_root() {
+        let root = PathBuf::from("music-downloads");
+        assert_eq!(
+            download_output_directory(&root, Some("../outside")),
+            root.join("_outside")
+        );
+        assert_eq!(download_output_directory(&root, None), root);
     }
 
     #[test]
@@ -1915,14 +2016,20 @@ mod tests {
         let directory = test_directory();
         let downloads = directory.join("Downloads");
         let outside = directory.join("outside.mp3");
-        fs::create_dir_all(&downloads).unwrap();
+        let playlist_directory = downloads.join("Playlist");
+        fs::create_dir_all(&playlist_directory).unwrap();
         let inside = downloads.join("track.mp3");
+        let nested = playlist_directory.join("nested.mp3");
         fs::write(&inside, b"audio").unwrap();
+        fs::write(&nested, b"audio").unwrap();
         fs::write(&outside, b"audio").unwrap();
         let state = AppState::load(directory.join("app-state.json"), downloads).unwrap();
 
         assert!(resolve_library_file(&state, inside.to_str().unwrap()).is_ok());
+        assert!(resolve_library_file(&state, nested.to_str().unwrap()).is_ok());
         assert!(resolve_library_file(&state, outside.to_str().unwrap()).is_err());
+        let files = collect_library_files(&directory.join("Downloads")).unwrap();
+        assert_eq!(files.len(), 2);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1943,6 +2050,7 @@ mod tests {
                     id: format!("job-{index}"),
                     url: format!("https://soundcloud.com/artist/track-{index}"),
                     title: format!("Track {index}"),
+                    playlist_name: None,
                     source_id: None,
                     artist: None,
                     duration: None,
