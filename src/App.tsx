@@ -16,10 +16,11 @@ import {
   X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 
 type Page = { title: string; subtitle: string; icon: LucideIcon };
@@ -542,7 +543,7 @@ function LibraryPage() {
     </div>
   );
 }
-function SettingsPage() {
+function SettingsPage({ onEngineStatusChange }: { onEngineStatusChange: (status: EngineStatus) => void }) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [engine, setEngine] = useState<EngineStatus | null>(null);
   const [error, setError] = useState('');
@@ -561,9 +562,10 @@ function SettingsPage() {
       .then(([loadedSettings, loadedEngine]) => {
         setSettings(loadedSettings);
         setEngine(loadedEngine);
+        onEngineStatusChange(loadedEngine);
       })
       .catch((cause: unknown) => setError(String(cause)));
-  }, []);
+  }, [onEngineStatusChange]);
 
   function update<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
     setSettings((current) => current ? { ...current, [key]: value } : current);
@@ -578,12 +580,29 @@ function SettingsPage() {
     try {
       const savedSettings = await invoke<AppSettings>('save_settings', { settings });
       setSettings(savedSettings);
-      setEngine(await invoke<EngineStatus>('get_engine_status'));
+      const currentEngine = await invoke<EngineStatus>('get_engine_status');
+      setEngine(currentEngine);
+      onEngineStatusChange(currentEngine);
       setSaved(true);
     } catch (cause) {
       setError(String(cause));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function chooseDownloadDirectory() {
+    if (!settings) return;
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: '다운로드 폴더 선택',
+        defaultPath: settings.downloadDirectory,
+      });
+      if (typeof selected === 'string') update('downloadDirectory', selected);
+    } catch (cause) {
+      setError(String(cause));
     }
   }
 
@@ -599,14 +618,24 @@ function SettingsPage() {
           <Card>
             <h2 className="font-semibold text-white">다운로드 기본값</h2>
             <div className="mt-5 grid gap-5 sm:grid-cols-2">
-              <label className="text-sm text-zinc-300 sm:col-span-2">
-                다운로드 폴더
-                <input
-                  value={settings.downloadDirectory}
-                  onChange={(event) => update('downloadDirectory', event.target.value)}
-                  className="mt-2 h-11 w-full rounded-xl border border-white/10 bg-black/20 px-3 text-white"
-                />
-              </label>
+              <div className="text-sm text-zinc-300 sm:col-span-2">
+                <label htmlFor="download-directory">다운로드 폴더</label>
+                <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                  <input
+                    id="download-directory"
+                    value={settings.downloadDirectory}
+                    onChange={(event) => update('downloadDirectory', event.target.value)}
+                    className="h-11 min-w-0 flex-1 rounded-xl border border-white/10 bg-black/20 px-3 text-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void chooseDownloadDirectory()}
+                    className="inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl border border-white/10 px-4 text-sm text-zinc-300 hover:bg-white/5"
+                  >
+                    <FolderOpen size={16} /> 폴더 찾기
+                  </button>
+                </div>
+              </div>
               <label className="text-sm text-zinc-300">
                 저장 형식
                 <select
@@ -724,6 +753,29 @@ export default function App() {
   const navigate = useNavigate();
   const page = pages[location.pathname] ?? pages['/'];
   const Icon = page.icon;
+  const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
+  const [engineStatusError, setEngineStatusError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    invoke<EngineStatus>('get_engine_status')
+      .then((status) => {
+        if (!active) return;
+        setEngineStatus(status);
+        setEngineStatusError(null);
+      })
+      .catch((cause: unknown) => {
+        if (!active) return;
+        setEngineStatus(null);
+        setEngineStatusError(String(cause));
+      });
+    return () => { active = false; };
+  }, []);
+
+  const updateEngineStatus = useCallback((status: EngineStatus) => {
+    setEngineStatus(status);
+    setEngineStatusError(null);
+  }, []);
 
   return (
     <div className="min-h-screen md:flex">
@@ -749,7 +801,18 @@ export default function App() {
             <div className="flex items-center gap-2 text-xs font-medium text-zinc-400">
               <span className="h-2 w-2 rounded-full bg-brand" /> 엔진 정보
             </div>
-            <p className="mt-2 text-xs leading-5 text-zinc-600">yt-dlp 및 FFmpeg 상태는 설정에서 확인하세요.</p>
+            <div className="mt-2 space-y-1.5">
+              {engineStatus
+                ? ([
+                    ['yt-dlp', engineStatus.ytDlp],
+                    ['FFmpeg', engineStatus.ffmpeg],
+                  ] as const).map(([name, tool]) => (
+                    <p key={name} className={`truncate text-xs ${tool.available ? 'text-emerald-400' : 'text-amber-400'}`} title={tool.available ? tool.version ?? undefined : tool.error ?? undefined}>
+                      {name}: {tool.available ? '정상 로드' : '확인 필요'}
+                    </p>
+                  ))
+                : <p className="truncate text-xs text-zinc-500" title={engineStatusError ?? undefined}>{engineStatusError ? '엔진 상태 확인 실패' : '엔진 상태 확인 중'}</p>}
+            </div>
           </div>
         </div>
       </aside>
@@ -774,7 +837,7 @@ export default function App() {
             <Route path="/playlist" element={<Playlist />} />
             <Route path="/downloads" element={<Downloads />} />
             <Route path="/library" element={<LibraryPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/settings" element={<SettingsPage onEngineStatusChange={updateEngineStatus} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
           <footer className="mt-8 border-t border-white/[.06] pt-4 text-xs text-zinc-700">
