@@ -27,6 +27,7 @@ pub struct AppSettings {
     pub audio_format: String,
     pub audio_quality: String,
     pub max_concurrent: usize,
+    pub language: String,
     pub overwrite_files: bool,
     pub embed_artwork: bool,
     pub embed_metadata: bool,
@@ -40,6 +41,7 @@ impl Default for AppSettings {
             audio_format: "original".into(),
             audio_quality: "192".into(),
             max_concurrent: 2,
+            language: "ko".into(),
             overwrite_files: false,
             embed_artwork: false,
             embed_metadata: false,
@@ -65,8 +67,11 @@ impl AppSettings {
         if !matches!(self.audio_quality.as_str(), "128" | "192" | "256" | "320") {
             return Err("음질은 128, 192, 256, 320 kbps 중에서 선택하세요.".into());
         }
-        if !(1..=4).contains(&self.max_concurrent) {
-            return Err("동시 작업 수는 1~4개로 설정해야 합니다.".into());
+        if !(1..=8).contains(&self.max_concurrent) {
+            return Err("동시 작업 수는 1~8개로 설정해야 합니다.".into());
+        }
+        if !matches!(self.language.as_str(), "ko" | "en") {
+            return Err("지원하지 않는 앱 언어입니다.".into());
         }
         Ok(())
     }
@@ -521,6 +526,16 @@ fn metadata_arguments(url: &str) -> [&str; 5] {
         "--dump-json",
         "--",
         url,
+    ]
+}
+
+fn download_performance_arguments(max_concurrent: usize) -> [String; 4] {
+    let download_slots = max_concurrent.clamp(1, 8);
+    [
+        "--concurrent-fragments".into(),
+        (8 / download_slots).to_string(),
+        "--progress-delta".into(),
+        "0.5".into(),
     ]
 }
 
@@ -1117,6 +1132,7 @@ fn execute_download(
     let output_template = directory.join(format!("{filename}.%(ext)s"));
     let mut command = Command::new(yt_dlp_executable(&settings.yt_dlp_path)?);
     command
+        .args(download_performance_arguments(settings.max_concurrent))
         .args([
             "--ignore-config",
             "--no-playlist",
@@ -1810,10 +1826,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_library_files, download_output_directory, inspect_executable, metadata_arguments,
-        parse_tracks, playlist_name_from_entry, playlist_name_from_url,
-        playlist_progress_from_line, resolve_library_file, safe_filename_component,
-        validate_soundcloud_url, yt_dlp_executable, AppSettings, AppState, DownloadJob, JobStatus,
+        collect_library_files, download_output_directory, download_performance_arguments,
+        inspect_executable, metadata_arguments, parse_tracks, playlist_name_from_entry,
+        playlist_name_from_url, playlist_progress_from_line, resolve_library_file,
+        safe_filename_component, validate_soundcloud_url, yt_dlp_executable, AppSettings, AppState,
+        DownloadJob, JobStatus,
     };
     use std::{fs, path::PathBuf};
 
@@ -1827,24 +1844,66 @@ mod tests {
 
     #[test]
     fn settings_reject_invalid_values() {
-        let mut settings = AppSettings::default();
-        settings.max_concurrent = 0;
-        assert!(settings.validate().is_err());
-        settings.max_concurrent = 2;
-        settings.audio_quality = "lossless".into();
-        assert!(settings.validate().is_err());
-        settings.audio_quality = "192".into();
-        settings.audio_format = "wav".into();
-        assert!(settings.validate().is_err());
-        settings.audio_format = "original".into();
-        settings.yt_dlp_path = "yt-dlp.exe".into();
-        assert!(settings.validate().is_err());
+        assert!(AppSettings {
+            max_concurrent: 0,
+            ..AppSettings::default()
+        }
+        .validate()
+        .is_err());
+        assert!(AppSettings {
+            audio_quality: "lossless".into(),
+            ..AppSettings::default()
+        }
+        .validate()
+        .is_err());
+        assert!(AppSettings {
+            audio_format: "wav".into(),
+            ..AppSettings::default()
+        }
+        .validate()
+        .is_err());
+        assert!(AppSettings {
+            yt_dlp_path: "yt-dlp.exe".into(),
+            ..AppSettings::default()
+        }
+        .validate()
+        .is_err());
+        assert!(AppSettings {
+            language: "fr".into(),
+            ..AppSettings::default()
+        }
+        .validate()
+        .is_err());
+        assert!(AppSettings {
+            max_concurrent: 9,
+            ..AppSettings::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
     fn settings_accept_supported_values() {
-        let settings = AppSettings::default();
+        let mut settings = AppSettings::default();
         assert!(settings.validate().is_ok());
+        settings.max_concurrent = 8;
+        settings.language = "en".into();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn download_pipeline_uses_parallel_fragments_and_throttled_progress() {
+        assert_eq!(
+            download_performance_arguments(1),
+            [
+                "--concurrent-fragments".to_string(),
+                "8".to_string(),
+                "--progress-delta".to_string(),
+                "0.5".to_string()
+            ]
+        );
+        assert_eq!(download_performance_arguments(4)[1], "2");
+        assert_eq!(download_performance_arguments(8)[1], "1");
     }
 
     #[cfg(unix)]
@@ -1995,6 +2054,7 @@ mod tests {
             let mut store = state.store.lock().unwrap();
             store.settings.audio_format = "mp3".into();
             store.settings.max_concurrent = 4;
+            store.settings.language = "en".into();
             state.persist_store(&store).unwrap();
         }
         drop(state);
@@ -2003,6 +2063,7 @@ mod tests {
         let store = restored.store.lock().unwrap();
         assert_eq!(store.settings.audio_format, "mp3");
         assert_eq!(store.settings.max_concurrent, 4);
+        assert_eq!(store.settings.language, "en");
         assert_eq!(
             store.settings.download_directory,
             directory.join("Downloads").to_string_lossy()
@@ -2045,8 +2106,8 @@ mod tests {
         .unwrap();
         {
             let mut store = state.store.lock().unwrap();
-            store.settings.max_concurrent = 2;
-            store.jobs = (0..3)
+            store.settings.max_concurrent = 8;
+            store.jobs = (0..9)
                 .map(|index| DownloadJob {
                     id: format!("job-{index}"),
                     url: format!("https://soundcloud.com/artist/track-{index}"),
@@ -2068,17 +2129,19 @@ mod tests {
             state.persist_store(&store).unwrap();
         }
 
-        let first = state.claim_next_job().unwrap().unwrap();
-        let second = state.claim_next_job().unwrap().unwrap();
-        assert_eq!([first.id.as_str(), second.id.as_str()], ["job-0", "job-1"]);
-        assert_eq!(state.active_workers.lock().unwrap().len(), 2);
-        assert_eq!(state.jobs().unwrap()[2].status, JobStatus::Queued);
+        let workers = (0..8)
+            .map(|_| state.claim_next_job().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(state.active_workers.lock().unwrap().len(), 8);
+        assert_eq!(state.jobs().unwrap()[8].status, JobStatus::Queued);
 
-        state.release_worker(&first.id);
-        let third = state.claim_next_job().unwrap().unwrap();
-        assert_eq!(third.id, "job-2");
-        state.release_worker(&second.id);
-        state.release_worker(&third.id);
+        state.release_worker(&workers[0].id);
+        let next = state.claim_next_job().unwrap().unwrap();
+        assert_eq!(next.id, "job-8");
+        for job in workers.iter().skip(1) {
+            state.release_worker(&job.id);
+        }
+        state.release_worker(&next.id);
 
         drop(state);
         fs::remove_dir_all(directory).unwrap();
