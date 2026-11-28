@@ -8,7 +8,7 @@
   "bundle": { "active": true, "targets": ["nsis"], "createUpdaterArtifacts": false },
   "plugins": {
     "updater": {
-      "pubkey": "untrusted comment: minisign public key: 84DB5E17550762CD\nRWTNYgdVF17bhOcDdXWPS6ef0g5Z6tBAqnXZ4SOMgBiFRwNkmrVpAM7O",
+      "pubkey": "RWTNYgdVF17bhOcDdXWPS6ef0g5Z6tBAqnXZ4SOMgBiFRwNkmrVpAM7O",
       "endpoints": [
         "https://github.com/KushKim/SC-dlp/releases/latest/download/latest.json"
       ],
