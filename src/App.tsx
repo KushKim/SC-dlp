@@ -2,6 +2,9 @@ import {
   Activity,
   ArrowDownToLine,
   ArrowUpRight,
+  ChevronDown,
+  ChevronUp,
+  CheckSquare,
   Disc3,
   FolderOpen,
   Home,
@@ -18,10 +21,13 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
+import { check as checkForAppUpdate } from '@tauri-apps/plugin-updater';
+import type { Update } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 
 type Language = 'ko' | 'en';
@@ -33,7 +39,7 @@ type AppSettings = {
   audioQuality: string;
   maxConcurrent: number;
   language: Language;
-  overwriteFiles: boolean;
+  duplicateHandling: 'skip' | 'overwrite' | 'rename';
   embedArtwork: boolean;
   embedMetadata: boolean;
 };
@@ -48,6 +54,7 @@ type DownloadJob = {
   url: string;
   title: string;
   playlistName: string | null;
+  duplicateHandling: AppSettings['duplicateHandling'];
   sourceId: string | null;
   artist: string | null;
   duration: number | null;
@@ -59,6 +66,15 @@ type DownloadJob = {
   outputPath: string | null;
 };
 type LibraryFile = { path: string; name: string; size: number; modified: number | null };
+type QueueResult = { jobs: DownloadJob[]; skippedDuplicates: number };
+type UpdateState = {
+  update: Update | null;
+  checking: boolean;
+  installing: boolean;
+  progress: number | null;
+  message: string;
+  error: string;
+};
 
 const LanguageContext = createContext<Language>('ko');
 
@@ -268,9 +284,12 @@ function Playlist() {
     setError('');
     setMessage('');
     try {
-      const jobs = await invoke<DownloadJob[]>('queue_downloads', { tracks, playlistName });
-      setMessage(t(`${jobs.length}개 작업을 대기열에 추가했습니다.`, `Added ${jobs.length} jobs to the queue.`));
-      navigate('/downloads');
+      const result = await invoke<QueueResult>('queue_downloads', { tracks, playlistName });
+      setMessage(t(
+        `${result.jobs.length}개 작업을 추가하고 중복 ${result.skippedDuplicates}개를 건너뛰었습니다.`,
+        `Added ${result.jobs.length} jobs and skipped ${result.skippedDuplicates} duplicate(s).`,
+      ));
+      if (result.jobs.length) navigate('/downloads');
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -280,6 +299,22 @@ function Playlist() {
 
   function toggleAll(selected: boolean) {
     setTracks((current) => current.map((track) => ({ ...track, selected })));
+  }
+
+  async function selectNewTracks() {
+    setError('');
+    try {
+      const ids = await invoke<string[]>('get_downloaded_track_ids', { tracks });
+      const downloaded = new Set(ids);
+      setTracks((current) => current.map((track) => ({
+        ...track,
+        selected: !track.sourceId || !downloaded.has(track.sourceId),
+      })));
+      const newCount = tracks.filter((track) => !track.sourceId || !downloaded.has(track.sourceId)).length;
+      setMessage(t(`${newCount}개의 신규 트랙을 선택했습니다.`, `Selected ${newCount} new track(s).`));
+    } catch (cause) {
+      setError(String(cause));
+    }
   }
 
   return (
@@ -335,6 +370,7 @@ function Playlist() {
             </div>
             <div className="flex flex-wrap gap-2">
               <button type="button" onClick={() => toggleAll(true)} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5">{t('전체 선택', 'Select all')}</button>
+              <button type="button" onClick={() => void selectNewTracks()} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5">{t('신규 트랙만 선택', 'Select new tracks')}</button>
               <button type="button" onClick={() => toggleAll(false)} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5">{t('전체 해제', 'Deselect all')}</button>
               <button type="button" onClick={addSelected} disabled={!selectedCount || adding} className="inline-flex items-center gap-2 rounded-lg bg-brand px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
                 <Play size={14} /> {t(`선택 항목 추가 (${selectedCount})`, `Add selected (${selectedCount})`)}
@@ -384,6 +420,7 @@ function Downloads() {
   const t = useText();
   const language = useContext(LanguageContext);
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -427,6 +464,20 @@ function Downloads() {
   }
 
   const activeJobs = jobs.filter((job) => job.status === 'queued' || job.status === 'downloading');
+  const selectableJobs = jobs.filter((job) => job.status !== 'downloading');
+  const queuedJobs = jobs.filter((job) => job.status === 'queued');
+
+  async function removeSelected() {
+    if (!selectedIds.length) return;
+    if (!window.confirm(t(
+      `${selectedIds.length}개 작업 기록을 대기열에서 제거할까요? 다운로드 파일은 삭제되지 않습니다.`,
+      `Remove ${selectedIds.length} selected job record(s)? Downloaded files will not be deleted.`,
+    ))) return;
+    await runAction(async () => {
+      await invoke('remove_download_jobs', { ids: selectedIds });
+      setSelectedIds([]);
+    });
+  }
 
   return (
     <div className="space-y-5">
@@ -449,12 +500,50 @@ function Downloads() {
             </button>
           </div>
         </div>
+        <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[.06] pt-3">
+          <button
+            type="button"
+            onClick={() => setSelectedIds(selectableJobs.map((job) => job.id))}
+            disabled={!selectableJobs.length}
+            className="rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-40"
+          >
+            <CheckSquare size={14} className="mr-1 inline" /> {t('선택 가능한 항목 선택', 'Select available')}
+          </button>
+          <button
+            type="button"
+            onClick={() => setSelectedIds([])}
+            disabled={!selectedIds.length}
+            className="rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-300 hover:bg-white/5 disabled:opacity-40"
+          >
+            {t('선택 해제', 'Clear selection')}
+          </button>
+          <button
+            type="button"
+            onClick={() => void removeSelected()}
+            disabled={!selectedIds.length}
+            className="inline-flex items-center gap-1 rounded-lg border border-red-500/30 px-3 py-2 text-xs text-red-300 hover:bg-red-500/10 disabled:opacity-40"
+          >
+            <Trash2 size={14} /> {t(`기록 제거 (${selectedIds.length})`, `Remove records (${selectedIds.length})`)}
+          </button>
+          <p className="text-xs text-zinc-600">{t('작업 기록 제거는 다운로드 파일을 삭제하지 않습니다.', 'Removing a record does not delete its downloaded file.')}</p>
+        </div>
       </Card>
       {loading && <EmptyState title={t('대기열을 불러오는 중', 'Loading queue')} description={t('저장된 실제 작업 상태를 확인하고 있습니다.', 'Checking saved job status.')} />}
       {!loading && jobs.length === 0 && <EmptyState title={t('대기열이 비어 있습니다', 'Queue is empty')} description={t('플레이리스트 페이지에서 URL을 분석하고 원하는 트랙을 선택하세요.', 'Analyze a URL on the Playlist page and select tracks to download.')} />}
       {jobs.map((job) => (
         <Card key={job.id}>
           <div className="flex flex-wrap items-start gap-3">
+            {job.status !== 'downloading' && (
+              <input
+                type="checkbox"
+                checked={selectedIds.includes(job.id)}
+                onChange={(event) => setSelectedIds((current) => event.target.checked
+                  ? [...current, job.id]
+                  : current.filter((id) => id !== job.id))}
+                className="mt-1 h-4 w-4 accent-orange-500"
+                aria-label={t(`${job.title} 작업 기록 선택`, `Select ${job.title} job record`)}
+              />
+            )}
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <h3 className="truncate text-sm font-semibold text-white">{job.title}</h3>
@@ -462,6 +551,24 @@ function Downloads() {
               </div>
               <p className="mt-1 truncate text-xs text-zinc-500">{job.artist || t('아티스트 정보 없음', 'Artist unavailable')} · {formatDuration(job.duration, language)}</p>
             </div>
+            {job.status === 'queued' && (
+              <div className="flex flex-col gap-1">
+                <button
+                  type="button"
+                  onClick={() => void runAction(() => invoke('move_queued_job', { id: job.id, direction: 'up' }))}
+                  disabled={queuedJobs[0]?.id === job.id}
+                  className="rounded border border-white/10 p-1 text-zinc-400 hover:text-white disabled:opacity-30"
+                  aria-label={t('대기열에서 위로 이동', 'Move up in queue')}
+                ><ChevronUp size={15} /></button>
+                <button
+                  type="button"
+                  onClick={() => void runAction(() => invoke('move_queued_job', { id: job.id, direction: 'down' }))}
+                  disabled={queuedJobs[queuedJobs.length - 1]?.id === job.id}
+                  className="rounded border border-white/10 p-1 text-zinc-400 hover:text-white disabled:opacity-30"
+                  aria-label={t('대기열에서 아래로 이동', 'Move down in queue')}
+                ><ChevronDown size={15} /></button>
+              </div>
+            )}
             {job.status === 'queued' || job.status === 'downloading' ? (
               <button type="button" onClick={() => void runAction(() => invoke('cancel_download', { id: job.id }))} className="rounded-lg border border-white/10 p-2 text-zinc-400 hover:text-white" aria-label={t('다운로드 취소', 'Cancel download')}>
                 <X size={16} />
@@ -577,9 +684,15 @@ function LibraryPage() {
 function SettingsPage({
   onEngineStatusChange,
   onLanguageChange,
+  updateState,
+  onCheckUpdates,
+  onInstallUpdate,
 }: {
   onEngineStatusChange: (status: EngineStatus) => void;
   onLanguageChange: (language: Language) => void;
+  updateState: UpdateState;
+  onCheckUpdates: () => void;
+  onInstallUpdate: () => void;
 }) {
   const t = useText();
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -590,6 +703,7 @@ function SettingsPage({
   const [aboutOpen, setAboutOpen] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [aboutError, setAboutError] = useState('');
+  const [backupMessage, setBackupMessage] = useState('');
   const tools: Array<{ name: string; status?: ToolStatus }> = [
     { name: 'yt-dlp', status: engine?.ytDlp },
     { name: 'FFmpeg', status: engine?.ffmpeg },
@@ -654,6 +768,63 @@ function SettingsPage({
         defaultPath: settings.downloadDirectory,
       });
       if (typeof selected === 'string') update('downloadDirectory', selected);
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }
+
+  async function exportSettingsBackup() {
+    setError('');
+    setBackupMessage('');
+    try {
+      const path = await saveDialog({
+        title: t('설정 백업 저장', 'Save settings backup'),
+        defaultPath: 'SC-dlp-settings.json',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!path) return;
+      await invoke('export_settings_backup', { path });
+      setBackupMessage(t('설정 백업을 저장했습니다.', 'Settings backup saved.'));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }
+
+  async function restoreSettingsBackup() {
+    setError('');
+    setBackupMessage('');
+    try {
+      const path = await openDialog({
+        title: t('설정 백업 선택', 'Select settings backup'),
+        multiple: false,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (typeof path !== 'string') return;
+      if (!window.confirm(t('현재 설정을 선택한 백업으로 바꿀까요?', 'Replace current settings with the selected backup?'))) return;
+      const restored = await invoke<AppSettings>('restore_settings_backup', { path });
+      setSettings(restored);
+      onLanguageChange(restored.language);
+      const currentEngine = await invoke<EngineStatus>('get_engine_status');
+      setEngine(currentEngine);
+      onEngineStatusChange(currentEngine);
+      setBackupMessage(t('설정을 복원했습니다.', 'Settings restored.'));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }
+
+  async function exportDiagnostics() {
+    setError('');
+    setBackupMessage('');
+    try {
+      const path = await saveDialog({
+        title: t('진단 로그 내보내기', 'Export diagnostic log'),
+        defaultPath: 'SC-dlp-diagnostics.txt',
+        filters: [{ name: 'Text', extensions: ['txt'] }],
+      });
+      if (!path) return;
+      await invoke('export_diagnostics', { path });
+      setBackupMessage(t('진단 보고서를 저장했습니다. 작업 ID가 포함될 수 있으니 공유 전에 확인하세요.', 'Diagnostic report saved. Review it before sharing; it may contain job IDs.'));
     } catch (cause) {
       setError(String(cause));
     }
@@ -746,12 +917,23 @@ function SettingsPage({
                   {Array.from({ length: 8 }, (_, index) => index + 1).map((count) => <option key={count} value={count}>{t(`${count}개`, `${count}`)}</option>)}
                 </select>
               </label>
+              <label className="text-sm text-zinc-300">
+                {t('중복 트랙 처리', 'Duplicate track handling')}
+                <select
+                  value={settings.duplicateHandling}
+                  onChange={(event) => update('duplicateHandling', event.target.value as AppSettings['duplicateHandling'])}
+                  className="mt-2 h-11 w-full rounded-xl border border-white/10 bg-[#15151c] px-3 text-white"
+                >
+                  <option value="skip">{t('건너뛰기', 'Skip')}</option>
+                  <option value="overwrite">{t('덮어쓰기', 'Overwrite')}</option>
+                  <option value="rename">{t('새 이름으로 저장', 'Save with a new name')}</option>
+                </select>
+              </label>
               <p className="text-xs leading-5 text-zinc-500 sm:col-span-2">
                 {t('MP3 변환과 커버 아트/메타데이터 삽입에는 FFmpeg가 필요합니다. 원본 오디오를 선택하면 변환하지 않습니다.', 'FFmpeg is required for MP3 conversion and embedding artwork or metadata. Original audio is not converted.')}
               </p>
               <div className="space-y-3 sm:col-span-2">
                 {([
-                  ['overwriteFiles', t('같은 이름의 파일 덮어쓰기', 'Overwrite files with the same name')],
                   ['embedArtwork', t('커버 아트 보존', 'Embed artwork')],
                   ['embedMetadata', t('메타데이터 보존', 'Embed metadata')],
                 ] as const).map(([key, label]) => (
@@ -778,6 +960,58 @@ function SettingsPage({
               </button>
               {saved && <span role="status" className="text-sm text-emerald-400">{t('설정을 저장했습니다.', 'Settings saved.')}</span>}
             </div>
+          </Card>
+          <Card>
+            <h2 className="font-semibold text-white">{t('앱 업데이트', 'Application updates')}</h2>
+            <p className="mt-2 text-sm text-zinc-500">
+              {updateState.update
+                ? t(`새 버전 ${updateState.update.version}을 사용할 수 있습니다. 설치는 사용자가 확인한 뒤 진행됩니다.`, `Version ${updateState.update.version} is available. Installation only starts after you confirm.`)
+                : updateState.message || t('시작할 때 업데이트를 확인합니다.', 'Updates are checked when the app starts.')}
+            </p>
+            {updateState.error && <p role="alert" className="mt-3 break-all text-sm text-red-300">{updateState.error}</p>}
+            {updateState.installing && updateState.progress !== null && (
+              <div className="mt-3">
+                <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                  <div className="h-full rounded-full bg-brand transition-all" style={{ width: `${updateState.progress}%` }} />
+                </div>
+                <p className="mt-1 text-xs text-zinc-500">{updateState.progress}%</p>
+              </div>
+            )}
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={onCheckUpdates}
+                disabled={updateState.checking || updateState.installing}
+                className="rounded-lg border border-white/10 px-3 py-2 text-sm text-zinc-300 hover:bg-white/5 disabled:opacity-40"
+              >
+                {updateState.checking ? t('업데이트 확인 중…', 'Checking for updates...') : t('업데이트 확인', 'Check for updates')}
+              </button>
+              {updateState.update && (
+                <button
+                  type="button"
+                  onClick={onInstallUpdate}
+                  disabled={updateState.installing}
+                  className="rounded-lg bg-brand px-3 py-2 text-sm font-semibold text-white disabled:opacity-40"
+                >
+                  {updateState.installing ? t('다운로드 및 설치 중…', 'Downloading and installing...') : t('업데이트 설치', 'Install update')}
+                </button>
+              )}
+            </div>
+            <p className="mt-3 text-xs leading-5 text-zinc-600">
+              {t('업데이트는 서명 검증을 통과한 경우에만 설치됩니다. 설치 중 앱이 종료되고 새 버전으로 다시 시작됩니다.', 'Updates install only after signature verification. The app closes during installation and restarts with the new version.')}
+            </p>
+          </Card>
+          <Card>
+            <h2 className="font-semibold text-white">{t('백업 및 진단', 'Backup and diagnostics')}</h2>
+            <p className="mt-2 text-sm leading-6 text-zinc-500">
+              {t('설정 백업에는 다운로드 폴더와 yt-dlp 경로가 포함됩니다. 진단 보고서에는 버전, 엔진 상태, 작업 수 및 최근 앱 이벤트가 포함되며 URL과 파일 경로는 기록하지 않습니다.', 'Settings backups include the download folder and yt-dlp path. Diagnostics include versions, engine status, job counts, and recent app events; URLs and file paths are not logged.')}
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button type="button" onClick={() => void exportSettingsBackup()} className="rounded-lg border border-white/10 px-3 py-2 text-sm text-zinc-300 hover:bg-white/5">{t('설정 백업 내보내기', 'Export settings')}</button>
+              <button type="button" onClick={() => void restoreSettingsBackup()} className="rounded-lg border border-white/10 px-3 py-2 text-sm text-zinc-300 hover:bg-white/5">{t('설정 백업 복원', 'Restore settings')}</button>
+              <button type="button" onClick={() => void exportDiagnostics()} className="rounded-lg border border-white/10 px-3 py-2 text-sm text-zinc-300 hover:bg-white/5">{t('진단 보고서 저장', 'Export diagnostics')}</button>
+            </div>
+            {backupMessage && <p role="status" className="mt-3 text-sm text-emerald-400">{backupMessage}</p>}
           </Card>
           <Card>
             <h2 className="font-semibold text-white">{t('다운로드 엔진', 'Download engines')}</h2>
@@ -851,6 +1085,15 @@ export default function App() {
   const [languageLoadError, setLanguageLoadError] = useState('');
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
   const [engineStatusError, setEngineStatusError] = useState<string | null>(null);
+  const [updateState, setUpdateState] = useState<UpdateState>({
+    update: null,
+    checking: false,
+    installing: false,
+    progress: null,
+    message: '',
+    error: '',
+  });
+  const updateCheckedOnStartup = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -880,6 +1123,85 @@ export default function App() {
     setEngineStatusError(null);
   }, []);
 
+  const checkForUpdates = useCallback(async () => {
+    if (!isTauri()) return;
+    setUpdateState((current) => ({
+      ...current,
+      checking: true,
+      message: '',
+      error: '',
+    }));
+    try {
+      const update = await checkForAppUpdate();
+      setUpdateState((current) => {
+        if (current.update && current.update !== update) void current.update.close();
+        return {
+          ...current,
+          update,
+          message: update
+            ? ''
+            : language === 'ko' ? '최신 버전을 사용 중입니다.' : 'You are using the latest version.',
+          error: '',
+        };
+      });
+    } catch (cause) {
+      setUpdateState((current) => ({
+        ...current,
+        error: String(cause),
+        message: '',
+      }));
+    } finally {
+      setUpdateState((current) => ({ ...current, checking: false }));
+    }
+  }, [language]);
+
+  const installUpdate = useCallback(async () => {
+    const update = updateState.update;
+    if (!update || updateState.installing) return;
+    const prompt = language === 'ko'
+      ? `SC-dlp ${update.version} 업데이트를 다운로드하고 설치할까요? 설치 중 앱이 종료됩니다.`
+      : `Download and install SC-dlp ${update.version}? The app will close during installation.`;
+    if (!window.confirm(prompt)) return;
+    setUpdateState((current) => ({
+      ...current,
+      installing: true,
+      progress: 0,
+      error: '',
+      message: '',
+    }));
+    try {
+      let downloaded = 0;
+      let contentLength = 0;
+      await update.downloadAndInstall((event) => {
+        if (event.event === 'Started') {
+          contentLength = event.data.contentLength ?? 0;
+        } else if (event.event === 'Progress') {
+          downloaded += event.data.chunkLength;
+          if (contentLength > 0) {
+            setUpdateState((current) => ({
+              ...current,
+              progress: Math.min(100, Math.round(downloaded / contentLength * 100)),
+            }));
+          }
+        }
+      });
+      await relaunch();
+    } catch (cause) {
+      setUpdateState((current) => ({
+        ...current,
+        installing: false,
+        progress: null,
+        error: String(cause),
+      }));
+    }
+  }, [language, updateState.installing, updateState.update]);
+
+  useEffect(() => {
+    if (updateCheckedOnStartup.current || !isTauri()) return;
+    updateCheckedOnStartup.current = true;
+    void checkForUpdates();
+  }, [checkForUpdates]);
+
   return (
     <LanguageContext.Provider value={language}>
       <AppShell
@@ -889,6 +1211,9 @@ export default function App() {
         engineStatus={engineStatus}
         engineStatusError={engineStatusError}
         onEngineStatusChange={updateEngineStatus}
+        updateState={updateState}
+        onCheckUpdates={() => void checkForUpdates()}
+        onInstallUpdate={() => void installUpdate()}
       />
     </LanguageContext.Provider>
   );
@@ -901,6 +1226,9 @@ function AppShell({
   engineStatus,
   engineStatusError,
   onEngineStatusChange,
+  updateState,
+  onCheckUpdates,
+  onInstallUpdate,
 }: {
   language: Language;
   onLanguageChange: (language: Language) => void;
@@ -908,6 +1236,9 @@ function AppShell({
   engineStatus: EngineStatus | null;
   engineStatusError: string | null;
   onEngineStatusChange: (status: EngineStatus) => void;
+  updateState: UpdateState;
+  onCheckUpdates: () => void;
+  onInstallUpdate: () => void;
 }) {
   const t = useText();
   const location = useLocation();
@@ -971,12 +1302,36 @@ function AppShell({
         </header>
         <main className="mx-auto max-w-[1440px] p-4 sm:p-5 md:p-8">
           {languageLoadError && <p role="alert" className="mb-4 break-all rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">{languageLoadError}</p>}
+          {(updateState.update || updateState.error || updateState.checking) && (
+            <section className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-brand/30 bg-brand/5 p-4" aria-live="polite">
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-white">
+                  {updateState.update
+                    ? t(`SC-dlp ${updateState.update.version} 업데이트를 사용할 수 있습니다.`, `SC-dlp ${updateState.update.version} is available.`)
+                    : updateState.checking
+                      ? t('업데이트를 확인하고 있습니다…', 'Checking for updates...')
+                      : t('업데이트 확인에 실패했습니다.', 'Update check failed.')}
+                </p>
+                {updateState.error && <p role="alert" className="mt-1 break-all text-xs text-red-300">{updateState.error}</p>}
+              </div>
+              {updateState.update && (
+                <button
+                  type="button"
+                  onClick={onInstallUpdate}
+                  disabled={updateState.installing}
+                  className="rounded-lg bg-brand px-3 py-2 text-sm font-semibold text-white disabled:opacity-40"
+                >
+                  {updateState.installing ? t('설치 중…', 'Installing...') : t('업데이트 설치', 'Install update')}
+                </button>
+              )}
+            </section>
+          )}
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/playlist" element={<Playlist />} />
             <Route path="/downloads" element={<Downloads />} />
             <Route path="/library" element={<LibraryPage />} />
-            <Route path="/settings" element={<SettingsPage onEngineStatusChange={onEngineStatusChange} onLanguageChange={onLanguageChange} />} />
+            <Route path="/settings" element={<SettingsPage onEngineStatusChange={onEngineStatusChange} onLanguageChange={onLanguageChange} updateState={updateState} onCheckUpdates={onCheckUpdates} onInstallUpdate={onInstallUpdate} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
           <footer className="mt-8 border-t border-white/[.06] pt-4 text-xs text-zinc-700">

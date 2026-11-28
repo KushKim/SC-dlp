@@ -1,9 +1,19 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SC-dlp",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "identifier": "com.kushkim.sc-dlp",
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:5173", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
   "app": { "windows": [{ "title": "SC-dlp", "width": 1360, "height": 860, "minWidth": 320, "minHeight": 560 }], "security": { "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost data:; style-src 'self' 'unsafe-inline'; script-src 'self'" } },
-  "bundle": { "active": true, "targets": ["nsis"] }
+  "bundle": { "active": true, "targets": ["nsis"], "createUpdaterArtifacts": false },
+  "plugins": {
+    "updater": {
+      "pubkey": "untrusted comment: minisign public key: 84DB5E17550762CD\nRWTNYgdVF17bhOcDdXWPS6ef0g5Z6tBAqnXZ4SOMgBiFRwNkmrVpAM7O",
+      "endpoints": [
+        "https://github.com/KushKim/SC-dlp/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": { "installMode": "passive" }
+    }
+  }
 }
