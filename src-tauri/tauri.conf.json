@@ -8,7 +8,7 @@
   "bundle": { "active": true, "targets": ["nsis"], "createUpdaterArtifacts": false },
   "plugins": {
     "updater": {
-      "pubkey": "RWTNYgdVF17bhOcDdXWPS6ef0g5Z6tBAqnXZ4SOMgBiFRwNkmrVpAM7O",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg0REI1RTE3NTUwNzYyQ0QKUldUTllnZFZGMTdiaE9jRGRYV1BTNmVmMGc1WjZ0QkFxblhaNFNPTWdCaUZSd05rbXJWcEFNN08=",
       "endpoints": [
         "https://github.com/KushKim/SC-dlp/releases/latest/download/latest.json"
       ],
