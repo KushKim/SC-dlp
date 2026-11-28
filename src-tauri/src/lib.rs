@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -28,7 +28,7 @@ pub struct AppSettings {
     pub audio_quality: String,
     pub max_concurrent: usize,
     pub language: String,
-    pub overwrite_files: bool,
+    pub duplicate_handling: String,
     pub embed_artwork: bool,
     pub embed_metadata: bool,
 }
@@ -42,7 +42,7 @@ impl Default for AppSettings {
             audio_quality: "192".into(),
             max_concurrent: 2,
             language: "ko".into(),
-            overwrite_files: false,
+            duplicate_handling: "skip".into(),
             embed_artwork: false,
             embed_metadata: false,
         }
@@ -73,7 +73,31 @@ impl AppSettings {
         if !matches!(self.language.as_str(), "ko" | "en") {
             return Err("지원하지 않는 앱 언어입니다.".into());
         }
+        if !matches!(
+            self.duplicate_handling.as_str(),
+            "skip" | "overwrite" | "rename"
+        ) {
+            return Err("중복 파일 처리 방식이 올바르지 않습니다.".into());
+        }
         Ok(())
+    }
+}
+
+fn migrate_settings_value(value: &mut serde_json::Value) {
+    if let Some(settings) = value
+        .get_mut("settings")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if !settings.contains_key("duplicateHandling") {
+            let old_overwrite = settings
+                .get("overwriteFiles")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            settings.insert(
+                "duplicateHandling".into(),
+                serde_json::Value::String(if old_overwrite { "overwrite" } else { "skip" }.into()),
+            );
+        }
     }
 }
 
@@ -131,6 +155,8 @@ pub struct DownloadJob {
     pub title: String,
     #[serde(default)]
     pub playlist_name: Option<String>,
+    #[serde(default = "default_duplicate_handling")]
+    pub duplicate_handling: String,
     pub source_id: Option<String>,
     pub artist: Option<String>,
     pub duration: Option<u64>,
@@ -155,8 +181,38 @@ struct LibraryFile {
     modified: Option<u64>,
 }
 
+fn default_duplicate_handling() -> String {
+    "skip".into()
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueResult {
+    jobs: Vec<DownloadJob>,
+    skipped_duplicates: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticsSummary {
+    app_version: &'static str,
+    operating_system: &'static str,
+    architecture: &'static str,
+    generated_at_unix: u64,
+    yt_dlp_available: bool,
+    yt_dlp_version: Option<String>,
+    ffmpeg_available: bool,
+    ffmpeg_version: Option<String>,
+    queued_jobs: usize,
+    downloading_jobs: usize,
+    completed_jobs: usize,
+    failed_jobs: usize,
+    cancelled_jobs: usize,
+}
+
 struct AppState {
     store_path: PathBuf,
+    diagnostics_path: PathBuf,
     store: Mutex<Store>,
     children: Mutex<HashMap<String, Child>>,
     analysis_children: Mutex<HashMap<String, Child>>,
@@ -170,8 +226,13 @@ struct AppState {
 impl AppState {
     fn load(store_path: PathBuf, download_directory: PathBuf) -> Result<Self, String> {
         let store = match fs::read(&store_path) {
-            Ok(contents) => serde_json::from_slice::<Store>(&contents)
-                .map_err(|error| format!("저장된 설정을 읽을 수 없습니다: {error}"))?,
+            Ok(contents) => {
+                let mut value = serde_json::from_slice::<serde_json::Value>(&contents)
+                    .map_err(|error| format!("저장된 설정을 읽을 수 없습니다: {error}"))?;
+                migrate_settings_value(&mut value);
+                serde_json::from_value::<Store>(value)
+                    .map_err(|error| format!("저장된 설정을 읽을 수 없습니다: {error}"))?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut store = Store::default();
                 store.settings.download_directory =
@@ -192,6 +253,7 @@ impl AppState {
         }
 
         let state = Self {
+            diagnostics_path: store_path.with_file_name("diagnostics.log"),
             store_path,
             store: Mutex::new(store),
             children: Mutex::new(HashMap::new()),
@@ -203,7 +265,37 @@ impl AppState {
             slot_changed: Condvar::new(),
         };
         state.persist()?;
+        state.append_diagnostic("Application state loaded");
         Ok(state)
+    }
+
+    fn append_diagnostic(&self, message: &str) {
+        const MAX_DIAGNOSTIC_BYTES: u64 = 512 * 1024;
+        if self
+            .diagnostics_path
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > MAX_DIAGNOSTIC_BYTES)
+        {
+            if let Err(error) = fs::remove_file(&self.diagnostics_path) {
+                eprintln!("Failed to rotate diagnostics log: {error}");
+            }
+        }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        match fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.diagnostics_path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = writeln!(file, "{timestamp} {message}") {
+                    eprintln!("Failed to append diagnostics log: {error}");
+                }
+            }
+            Err(error) => eprintln!("Failed to open diagnostics log: {error}"),
+        }
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -296,6 +388,10 @@ impl AppState {
                         active_workers.remove(&store.jobs[index].id);
                         return Err(error);
                     }
+                    self.append_diagnostic(&format!(
+                        "Download started: job {}",
+                        store.jobs[index].id
+                    ));
                     return Ok(Some(store.jobs[index].clone()));
                 }
             }
@@ -1055,6 +1151,20 @@ fn run_job(app: &AppHandle, state: &AppState, job: DownloadJob) {
     let attempt = job.attempt;
     emit_job(app, &job);
     let result = execute_download(app, state, &job);
+    let was_cancelled = state.jobs().ok().is_some_and(|jobs| {
+        jobs.iter()
+            .any(|current| current.id == id && current.status == JobStatus::Cancelled)
+    });
+    state.append_diagnostic(&format!(
+        "Download {}: job {id}",
+        if was_cancelled {
+            "cancelled"
+        } else if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        }
+    ));
     let update = state.update_job(id, true, |job| {
         if job.attempt != attempt || job.status == JobStatus::Cancelled {
             return;
@@ -1129,6 +1239,11 @@ fn execute_download(
         safe_filename_component(&job.title, 100),
         safe_filename_component(job.source_id.as_deref().unwrap_or(&job.id), 40)
     );
+    let filename = if job.duplicate_handling == "rename" {
+        format!("{filename} ({})", safe_filename_component(&job.id, 40))
+    } else {
+        filename
+    };
     let output_template = directory.join(format!("{filename}.%(ext)s"));
     let mut command = Command::new(yt_dlp_executable(&settings.yt_dlp_path)?);
     command
@@ -1136,6 +1251,7 @@ fn execute_download(
         .args([
             "--ignore-config",
             "--no-playlist",
+            "--continue",
             "--newline",
             "--no-color",
             "--progress-template",
@@ -1146,7 +1262,7 @@ fn execute_download(
         .arg("--output")
         .arg(&output_template);
 
-    if settings.overwrite_files {
+    if job.duplicate_handling == "overwrite" {
         command.arg("--force-overwrites");
     } else {
         command.arg("--no-overwrites");
@@ -1261,16 +1377,6 @@ fn execute_download(
     let status = child
         .wait()
         .map_err(|error| format!("yt-dlp 종료 상태를 확인하지 못했습니다: {error}"))?;
-    let cancelled = state
-        .jobs()?
-        .into_iter()
-        .find(|current| current.id == job.id)
-        .is_some_and(|current| {
-            current.attempt == job.attempt && current.status == JobStatus::Cancelled
-        });
-    if cancelled {
-        remove_partial_files(&directory, &filename);
-    }
     if let Some(error) = stream_error.or(process_control_error) {
         return Err(error);
     }
@@ -1322,26 +1428,6 @@ fn terminate_child_tree(child: &mut Child) -> Result<(), String> {
     child
         .kill()
         .map_err(|error| format!("다운로드 프로세스 트리를 종료하지 못했습니다: {error}"))
-}
-
-fn remove_partial_files(directory: &Path, filename: &str) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_partial = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.starts_with(&format!("{filename}.")) && name.ends_with(".part")
-            });
-        if is_partial {
-            if let Err(error) = fs::remove_file(path) {
-                eprintln!("Failed to remove a cancelled partial download: {error}");
-            }
-        }
-    }
 }
 
 fn update_progress(state: &AppState, app: &AppHandle, id: &str, attempt: u64, value: &str) {
@@ -1466,6 +1552,205 @@ fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<Ap
     Ok(store.settings.clone())
 }
 
+fn write_user_selected_file(path: &str, contents: &[u8]) -> Result<(), String> {
+    let destination = PathBuf::from(path);
+    if !destination.is_absolute() || destination.file_name().is_none() {
+        return Err("선택한 파일 경로가 올바르지 않습니다.".into());
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| "선택한 파일의 폴더에 접근할 수 없습니다.".to_string())?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "선택한 파일 이름이 올바르지 않습니다.".to_string())?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("파일을 임시 저장할 수 없습니다: {error}"))?;
+    replace_file(&temporary, &destination)
+}
+
+fn protect_app_data_targets(path: &str, state: &AppState) -> Result<(), String> {
+    let destination = PathBuf::from(path);
+    let name = destination
+        .file_name()
+        .ok_or_else(|| "선택한 파일 이름이 올바르지 않습니다.".to_string())?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "선택한 파일 폴더가 올바르지 않습니다.".to_string())?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| format!("선택한 파일 폴더를 확인할 수 없습니다: {error}"))?;
+    let normalized_destination =
+        fs::canonicalize(&destination).unwrap_or_else(|_| canonical_parent.join(name));
+    for protected in [&state.store_path, &state.diagnostics_path] {
+        let normalized_protected = fs::canonicalize(protected).unwrap_or_else(|_| {
+            protected
+                .parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .zip(protected.file_name())
+                .map(|(parent, name)| parent.join(name))
+                .unwrap_or_else(|| protected.clone())
+        });
+        #[cfg(windows)]
+        let same_path = normalized_destination
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&normalized_protected.to_string_lossy());
+        #[cfg(not(windows))]
+        let same_path = normalized_destination == normalized_protected;
+        if same_path {
+            return Err("앱 내부 데이터 파일을 내보내기 대상으로 선택할 수 없습니다.".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_settings_for_import(settings: &AppSettings) -> Result<(), String> {
+    settings.validate()?;
+    if !settings.yt_dlp_path.trim().is_empty() {
+        let executable = yt_dlp_executable(&settings.yt_dlp_path)?;
+        let status = inspect_executable(&executable, "--version");
+        if !status.available {
+            return Err(status
+                .error
+                .unwrap_or_else(|| "설정 백업의 yt-dlp 경로를 확인할 수 없습니다.".into()));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn export_settings_backup(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    protect_app_data_targets(&path, &state)?;
+    let settings = state
+        .store
+        .lock()
+        .map_err(|_| "앱 설정 잠금에 실패했습니다.".to_string())?
+        .settings
+        .clone();
+    let contents = serde_json::to_vec_pretty(&settings)
+        .map_err(|error| format!("설정을 JSON으로 변환할 수 없습니다: {error}"))?;
+    write_user_selected_file(&path, &contents)
+}
+
+#[tauri::command]
+fn restore_settings_backup(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<AppSettings, String> {
+    let contents =
+        fs::read(&path).map_err(|error| format!("설정 백업을 읽을 수 없습니다: {error}"))?;
+    if contents.len() > 256 * 1024 {
+        return Err("설정 백업 파일이 너무 큽니다.".into());
+    }
+    let mut value = serde_json::from_slice::<serde_json::Value>(&contents)
+        .map_err(|error| format!("설정 백업 형식이 올바르지 않습니다: {error}"))?;
+    if let Some(settings) = value.as_object_mut() {
+        let old_overwrite = settings
+            .get("overwriteFiles")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !settings.contains_key("duplicateHandling") {
+            settings.insert(
+                "duplicateHandling".into(),
+                serde_json::Value::String(if old_overwrite { "overwrite" } else { "skip" }.into()),
+            );
+        }
+    }
+    let settings = serde_json::from_value::<AppSettings>(value)
+        .map_err(|error| format!("설정 백업 형식이 올바르지 않습니다: {error}"))?;
+    validate_settings_for_import(&settings)?;
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "앱 설정 잠금에 실패했습니다.".to_string())?;
+    let previous = store.settings.clone();
+    store.settings = settings;
+    if let Err(error) = state.persist_store(&store) {
+        store.settings = previous;
+        return Err(error);
+    }
+    Ok(store.settings.clone())
+}
+
+#[tauri::command]
+fn export_diagnostics(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    protect_app_data_targets(&path, &state)?;
+    let (settings, jobs) = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "앱 설정 잠금에 실패했습니다.".to_string())?;
+        (store.settings.clone(), store.jobs.clone())
+    };
+    #[cfg(windows)]
+    let (yt_dlp_names, ffmpeg_names) = (["yt-dlp.exe", "yt-dlp"], ["ffmpeg.exe", "ffmpeg"]);
+    #[cfg(not(windows))]
+    let (yt_dlp_names, ffmpeg_names) = (["yt-dlp", "yt-dlp"], ["ffmpeg", "ffmpeg"]);
+    let yt_dlp = if settings.yt_dlp_path.trim().is_empty() {
+        inspect_tool(&yt_dlp_names, "--version")
+    } else {
+        yt_dlp_executable(&settings.yt_dlp_path)
+            .map(|path| inspect_executable(&path, "--version"))
+            .unwrap_or(ToolStatus {
+                available: false,
+                version: None,
+                error: Some("Configured executable could not be inspected.".into()),
+            })
+    };
+    let ffmpeg = inspect_tool(&ffmpeg_names, "-version");
+    let summary = DiagnosticsSummary {
+        app_version: env!("CARGO_PKG_VERSION"),
+        operating_system: env::consts::OS,
+        architecture: env::consts::ARCH,
+        generated_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default(),
+        yt_dlp_available: yt_dlp.available,
+        yt_dlp_version: yt_dlp.version,
+        ffmpeg_available: ffmpeg.available,
+        ffmpeg_version: ffmpeg.version,
+        queued_jobs: jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Queued)
+            .count(),
+        downloading_jobs: jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Downloading)
+            .count(),
+        completed_jobs: jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Completed)
+            .count(),
+        failed_jobs: jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Failed)
+            .count(),
+        cancelled_jobs: jobs
+            .iter()
+            .filter(|job| job.status == JobStatus::Cancelled)
+            .count(),
+    };
+    let serialized = serde_json::to_string_pretty(&summary)
+        .map_err(|error| format!("진단 정보를 JSON으로 변환할 수 없습니다: {error}"))?;
+    let log_contents = fs::read_to_string(&state.diagnostics_path)
+        .map_err(|error| format!("진단 로그를 읽을 수 없습니다: {error}"))?;
+    let recent_logs = log_contents
+        .lines()
+        .rev()
+        .take(200)
+        .collect::<VecDeque<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = format!(
+        "SC-dlp diagnostic report\n\n{serialized}\n\nRecent application log (may contain job identifiers):\n{recent_logs}\n"
+    );
+    write_user_selected_file(&path, report.as_bytes())
+}
+
 #[tauri::command]
 fn get_engine_status(state: State<'_, AppState>) -> Result<EngineStatus, String> {
     #[cfg(windows)]
@@ -1504,13 +1789,182 @@ fn get_download_jobs(state: State<'_, AppState>) -> Result<Vec<DownloadJob>, Str
     state.jobs()
 }
 
+fn reorder_queued_jobs(
+    jobs: &mut [DownloadJob],
+    id: &str,
+    direction: &str,
+) -> Result<bool, String> {
+    let offset = match direction {
+        "up" => -1,
+        "down" => 1,
+        _ => return Err("작업 이동 방향이 올바르지 않습니다.".into()),
+    };
+    let queued_indices = jobs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, job)| (job.status == JobStatus::Queued).then_some(index))
+        .collect::<Vec<_>>();
+    let queue_position = queued_indices
+        .iter()
+        .position(|index| jobs[*index].id == id)
+        .ok_or_else(|| "대기 중인 작업만 순서를 변경할 수 있습니다.".to_string())?;
+    let target_position = queue_position as isize + offset;
+    if !(0..queued_indices.len() as isize).contains(&target_position) {
+        return Ok(false);
+    }
+    jobs.swap(
+        queued_indices[queue_position],
+        queued_indices[target_position as usize],
+    );
+    Ok(true)
+}
+
+fn remove_jobs_by_id(
+    jobs: &mut Vec<DownloadJob>,
+    selected: &HashSet<String>,
+) -> Result<(), String> {
+    if selected.is_empty()
+        || selected
+            .iter()
+            .any(|id| !jobs.iter().any(|job| &job.id == id))
+    {
+        return Err("선택한 작업 기록 중 찾을 수 없는 항목이 있습니다.".into());
+    }
+    if jobs
+        .iter()
+        .any(|job| selected.contains(&job.id) && job.status == JobStatus::Downloading)
+    {
+        return Err("다운로드 중인 작업은 기록에서 제거할 수 없습니다. 먼저 취소하세요.".into());
+    }
+    jobs.retain(|job| !selected.contains(&job.id));
+    Ok(())
+}
+
+#[tauri::command]
+fn move_queued_job(
+    id: String,
+    direction: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<DownloadJob>, String> {
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "다운로드 대기열 잠금에 실패했습니다.".to_string())?;
+    let previous_jobs = store.jobs.clone();
+    if !reorder_queued_jobs(&mut store.jobs, &id, &direction)? {
+        return Ok(previous_jobs);
+    }
+    if let Err(error) = state.persist_store(&store) {
+        store.jobs = previous_jobs;
+        return Err(error);
+    }
+    Ok(store.jobs.clone())
+}
+
+#[tauri::command]
+fn remove_download_jobs(
+    ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<DownloadJob>, String> {
+    if ids.is_empty() {
+        return Err("삭제할 작업 기록을 선택하세요.".into());
+    }
+    let selected = ids.into_iter().collect::<HashSet<_>>();
+    let mut store = state
+        .store
+        .lock()
+        .map_err(|_| "다운로드 대기열 잠금에 실패했습니다.".to_string())?;
+    let previous_jobs = store.jobs.clone();
+    remove_jobs_by_id(&mut store.jobs, &selected)?;
+    if let Err(error) = state.persist_store(&store) {
+        store.jobs = previous_jobs;
+        return Err(error);
+    }
+    Ok(store.jobs.clone())
+}
+
+fn library_track_ids(directory: &Path) -> Result<HashSet<String>, String> {
+    if !directory.is_dir() {
+        return Ok(HashSet::new());
+    }
+    let files = collect_library_files(directory)?;
+    Ok(files
+        .into_iter()
+        .filter_map(|file| {
+            let filename = Path::new(&file.name).file_stem()?.to_str()?;
+            let start = filename.rfind('[')? + 1;
+            let end = filename[start..].find(']')? + start;
+            let id = filename[start..end].trim();
+            (!id.is_empty()).then(|| id.to_string())
+        })
+        .collect())
+}
+
+fn track_key(track: &TrackMetadata) -> String {
+    track
+        .source_id
+        .as_deref()
+        .map(|id| format!("id:{}", safe_filename_component(id, 40)))
+        .unwrap_or_else(|| format!("url:{}", track.url))
+}
+
+fn same_track(track: &TrackMetadata, job: &DownloadJob) -> bool {
+    match (&track.source_id, &job.source_id) {
+        (Some(source_id), Some(job_source_id)) => source_id == job_source_id,
+        _ => track.url == job.url,
+    }
+}
+
+fn track_job_is_pending(job: &DownloadJob) -> bool {
+    matches!(job.status, JobStatus::Queued | JobStatus::Downloading)
+}
+
+fn track_already_queued_or_downloaded(track: &TrackMetadata, jobs: &[DownloadJob]) -> bool {
+    jobs.iter().any(|job| {
+        same_track(track, job)
+            && (track_job_is_pending(job)
+                || (job.status == JobStatus::Completed
+                    && job
+                        .output_path
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).is_file())))
+    })
+}
+
+#[tauri::command]
+fn get_downloaded_track_ids(
+    tracks: Vec<TrackMetadata>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let (directory, jobs) = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "앱 설정 잠금에 실패했습니다.".to_string())?;
+        (
+            PathBuf::from(&store.settings.download_directory),
+            store.jobs.clone(),
+        )
+    };
+    let ids = library_track_ids(&directory)?;
+    Ok(tracks
+        .iter()
+        .filter_map(|track| {
+            let source_id = track.source_id.as_deref()?;
+            (ids.contains(&safe_filename_component(source_id, 40))
+                || track_already_queued_or_downloaded(track, &jobs))
+            .then(|| source_id.to_string())
+        })
+        .collect())
+}
+
 #[tauri::command]
 fn queue_downloads(
     tracks: Vec<TrackMetadata>,
     playlist_name: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<Vec<DownloadJob>, String> {
+) -> Result<QueueResult, String> {
     let playlist_name = match playlist_name {
         Some(name) => {
             let name = name.trim();
@@ -1539,6 +1993,49 @@ fn queue_downloads(
         return Err("대기열에 추가할 트랙을 선택하세요.".into());
     }
 
+    let (settings, existing_jobs) = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| "다운로드 대기열 잠금에 실패했습니다.".to_string())?;
+        (store.settings.clone(), store.jobs.clone())
+    };
+    let existing_ids = library_track_ids(Path::new(&settings.download_directory))?;
+    let mut encountered = HashSet::new();
+    let mut skipped_duplicates = 0;
+    let selected = selected
+        .into_iter()
+        .filter(|track| {
+            let duplicate = match settings.duplicate_handling.as_str() {
+                "skip" => {
+                    track_already_queued_or_downloaded(track, &existing_jobs)
+                        || track.source_id.as_deref().is_some_and(|id| {
+                            existing_ids.contains(&safe_filename_component(id, 40))
+                        })
+                        || !encountered.insert(track_key(track))
+                }
+                "overwrite" => {
+                    existing_jobs
+                        .iter()
+                        .any(|job| track_job_is_pending(job) && same_track(track, job))
+                        || !encountered.insert(track_key(track))
+                }
+                "rename" => false,
+                _ => true,
+            };
+            if duplicate {
+                skipped_duplicates += 1;
+            }
+            !duplicate
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(QueueResult {
+            jobs: Vec::new(),
+            skipped_duplicates,
+        });
+    }
+
     let jobs = selected
         .into_iter()
         .map(|track| DownloadJob {
@@ -1546,6 +2043,7 @@ fn queue_downloads(
             url: track.url,
             title: track.title,
             playlist_name: playlist_name.clone(),
+            duplicate_handling: settings.duplicate_handling.clone(),
             source_id: track.source_id,
             artist: track.artist,
             duration: track.duration,
@@ -1571,11 +2069,18 @@ fn queue_downloads(
             return Err(error);
         }
     }
+    state.append_diagnostic(&format!(
+        "Queued {} download(s); skipped {skipped_duplicates} duplicate(s)",
+        jobs.len()
+    ));
     for job in &jobs {
         emit_job(&app, job);
     }
     state.slot_changed.notify_all();
-    Ok(jobs)
+    Ok(QueueResult {
+        jobs,
+        skipped_duplicates,
+    })
 }
 
 fn cancel_job_inner(app: &AppHandle, state: &AppState, id: &str) -> Result<DownloadJob, String> {
@@ -1608,6 +2113,7 @@ fn cancel_job_inner(app: &AppHandle, state: &AppState, id: &str) -> Result<Downl
             return Err("대기 중이거나 진행 중인 작업만 취소할 수 있습니다.".into());
         }
     };
+    state.append_diagnostic(&format!("Download cancelled: job {id}"));
     emit_job(app, &job);
     state.slot_changed.notify_all();
     Ok(job)
@@ -1784,6 +2290,8 @@ fn open_library_folder(state: State<'_, AppState>) -> Result<(), String> {
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             let download_directory = app
@@ -1799,11 +2307,17 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            export_settings_backup,
+            restore_settings_backup,
+            export_diagnostics,
             get_engine_status,
             analyze_url,
             cancel_playlist_analysis,
             get_download_jobs,
+            get_downloaded_track_ids,
             queue_downloads,
+            move_queued_job,
+            remove_download_jobs,
             cancel_download,
             cancel_all_downloads,
             retry_download,
@@ -1827,12 +2341,14 @@ pub fn run() {
 mod tests {
     use super::{
         collect_library_files, download_output_directory, download_performance_arguments,
-        inspect_executable, metadata_arguments, parse_tracks, playlist_name_from_entry,
-        playlist_name_from_url, playlist_progress_from_line, resolve_library_file,
-        safe_filename_component, validate_soundcloud_url, yt_dlp_executable, AppSettings, AppState,
-        DownloadJob, JobStatus,
+        inspect_executable, library_track_ids, metadata_arguments, migrate_settings_value,
+        parse_tracks, playlist_name_from_entry, playlist_name_from_url,
+        playlist_progress_from_line, protect_app_data_targets, remove_jobs_by_id,
+        reorder_queued_jobs, resolve_library_file, safe_filename_component,
+        track_already_queued_or_downloaded, validate_soundcloud_url, yt_dlp_executable,
+        AppSettings, AppState, DownloadJob, JobStatus, Store, TrackMetadata,
     };
-    use std::{fs, path::PathBuf};
+    use std::{collections::HashSet, fs, path::PathBuf};
 
     fn test_directory() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1840,6 +2356,27 @@ mod tests {
             std::process::id(),
             super::JOB_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    fn test_job(id: &str, status: JobStatus) -> DownloadJob {
+        DownloadJob {
+            id: id.into(),
+            url: format!("https://soundcloud.com/artist/{id}"),
+            title: id.into(),
+            playlist_name: None,
+            duplicate_handling: "skip".into(),
+            source_id: None,
+            artist: None,
+            duration: None,
+            status,
+            progress: 0.0,
+            speed: None,
+            eta: None,
+            error: None,
+            output_path: None,
+            cancel_requested: false,
+            attempt: 0,
+        }
     }
 
     #[test]
@@ -1880,6 +2417,12 @@ mod tests {
         }
         .validate()
         .is_err());
+        assert!(AppSettings {
+            duplicate_handling: "merge".into(),
+            ..AppSettings::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1888,7 +2431,16 @@ mod tests {
         assert!(settings.validate().is_ok());
         settings.max_concurrent = 8;
         settings.language = "en".into();
+        settings.duplicate_handling = "rename".into();
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_overwrite_setting_migrates_to_duplicate_handling() {
+        let mut value = serde_json::json!({ "settings": { "overwriteFiles": true } });
+        migrate_settings_value(&mut value);
+        let store = serde_json::from_value::<Store>(value).unwrap();
+        assert_eq!(store.settings.duplicate_handling, "overwrite");
     }
 
     #[test]
@@ -2096,6 +2648,118 @@ mod tests {
     }
 
     #[test]
+    fn library_track_ids_are_detected_for_incremental_playlist_selection() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("Artist - Song [12345].mp3"), b"audio").unwrap();
+
+        let ids = library_track_ids(&directory).unwrap();
+        assert!(ids.contains("12345"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn existing_tracks_are_detected_only_when_the_completed_file_exists() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("Artist - Track [123].mp3");
+        fs::write(&output, b"audio").unwrap();
+        let track = TrackMetadata {
+            url: "https://soundcloud.com/artist/track".into(),
+            title: "Track".into(),
+            source_id: Some("123".into()),
+            artist: Some("Artist".into()),
+            duration: None,
+            selected: true,
+        };
+        let completed_job = DownloadJob {
+            id: "job-1".into(),
+            url: track.url.clone(),
+            title: track.title.clone(),
+            playlist_name: None,
+            duplicate_handling: "skip".into(),
+            source_id: track.source_id.clone(),
+            artist: track.artist.clone(),
+            duration: None,
+            status: JobStatus::Completed,
+            progress: 100.0,
+            speed: None,
+            eta: None,
+            error: None,
+            output_path: Some(output.to_string_lossy().into_owned()),
+            cancel_requested: false,
+            attempt: 0,
+        };
+
+        assert!(track_already_queued_or_downloaded(
+            &track,
+            std::slice::from_ref(&completed_job)
+        ));
+        fs::remove_file(output).unwrap();
+        assert!(!track_already_queued_or_downloaded(
+            &track,
+            std::slice::from_ref(&completed_job)
+        ));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn queued_job_order_can_change_without_moving_active_jobs() {
+        let mut jobs = vec![
+            test_job("active", JobStatus::Downloading),
+            test_job("first", JobStatus::Queued),
+            test_job("second", JobStatus::Queued),
+        ];
+
+        assert!(reorder_queued_jobs(&mut jobs, "second", "up").unwrap());
+        assert_eq!(jobs[0].id, "active");
+        assert_eq!(jobs[1].id, "second");
+        assert_eq!(jobs[2].id, "first");
+        assert!(!reorder_queued_jobs(&mut jobs, "second", "up").unwrap());
+    }
+
+    #[test]
+    fn bulk_removal_rejects_active_jobs_and_preserves_files() {
+        let mut jobs = vec![
+            test_job("queued", JobStatus::Queued),
+            test_job("active", JobStatus::Downloading),
+            test_job("done", JobStatus::Completed),
+        ];
+        let active_ids = HashSet::from(["active".to_string()]);
+        assert!(remove_jobs_by_id(&mut jobs, &active_ids).is_err());
+        assert_eq!(jobs.len(), 3);
+
+        let removable_ids = HashSet::from(["queued".to_string(), "done".to_string()]);
+        remove_jobs_by_id(&mut jobs, &removable_ids).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "active");
+    }
+
+    #[test]
+    fn exports_cannot_overwrite_app_data_or_diagnostics() {
+        let directory = test_directory();
+        let state = AppState::load(
+            directory.join("app-state.json"),
+            directory.join("Downloads"),
+        )
+        .unwrap();
+
+        assert!(protect_app_data_targets(state.store_path.to_str().unwrap(), &state).is_err());
+        assert!(
+            protect_app_data_targets(state.diagnostics_path.to_str().unwrap(), &state).is_err()
+        );
+        assert!(
+            protect_app_data_targets(directory.join("backup.json").to_str().unwrap(), &state)
+                .is_ok()
+        );
+
+        drop(state);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn scheduler_dispatches_queued_jobs_in_fifo_order_with_configured_limit() {
         let directory = test_directory();
         fs::create_dir_all(&directory).unwrap();
@@ -2108,23 +2772,7 @@ mod tests {
             let mut store = state.store.lock().unwrap();
             store.settings.max_concurrent = 8;
             store.jobs = (0..9)
-                .map(|index| DownloadJob {
-                    id: format!("job-{index}"),
-                    url: format!("https://soundcloud.com/artist/track-{index}"),
-                    title: format!("Track {index}"),
-                    playlist_name: None,
-                    source_id: None,
-                    artist: None,
-                    duration: None,
-                    status: JobStatus::Queued,
-                    progress: 0.0,
-                    speed: None,
-                    eta: None,
-                    error: None,
-                    output_path: None,
-                    cancel_requested: false,
-                    attempt: 0,
-                })
+                .map(|index| test_job(&format!("job-{index}"), JobStatus::Queued))
                 .collect();
             state.persist_store(&store).unwrap();
         }
